@@ -1,0 +1,6 @@
+{
+  "name": "MedSupply Sentinel",
+  "description": "Blockchain-based anti-counterfeit medicine traceability with QR verification, cold-chain monitoring, and AI risk detection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
