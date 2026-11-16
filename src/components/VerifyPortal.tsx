@@ -24,7 +24,7 @@ import {
   PUFMatchResult,
   generateMerkleInclusionProof,
   computeEIP712AttestationDigest,
-  buildGS1DigitalLink,
+  buildPhoneScannableQRCertificate,
 } from '../utils/sentinelLogic';
 import {
   formatActorDisplayName,
@@ -83,6 +83,7 @@ interface VerifyPortalProps {
   reportSubmittedMsg: string;
   onSubmitReport: (e: React.FormEvent) => void;
   batches: BatchRecord[];
+  dispensedSampleSerial?: string;
 }
 
 export const VerifyPortal: React.FC<VerifyPortalProps> = ({
@@ -118,6 +119,7 @@ export const VerifyPortal: React.FC<VerifyPortalProps> = ({
   onReportNotesChange,
   reportSubmittedMsg,
   onSubmitReport,
+  dispensedSampleSerial = 'SN-PCV20-2026-0005',
 }) => {
   const [showTechnicalProof, setShowTechnicalProof] = useState<boolean>(false);
   const [showOfflineControls, setShowOfflineControls] = useState<boolean>(false);
@@ -191,6 +193,8 @@ export const VerifyPortal: React.FC<VerifyPortalProps> = ({
 
           <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
             <select
+              id="verify-scanner-location"
+              name="scannerLocation"
               aria-label="Scanner Location"
               value={scanCheckpointKey}
               onChange={(e) => onSelectCheckpoint(e.target.value)}
@@ -277,6 +281,13 @@ export const VerifyPortal: React.FC<VerifyPortalProps> = ({
             className="px-2.5 py-1 rounded-md bg-slate-950 hover:bg-slate-800 text-rose-300 border border-slate-800 transition-colors"
           >
             Quarantined Lot
+          </button>
+          <button
+            type="button"
+            onClick={() => onVerify(dispensedSampleSerial, false)}
+            className="px-2.5 py-1 rounded-md bg-slate-950 hover:bg-slate-800 text-rose-300 border border-rose-800/70 transition-colors"
+          >
+            Previously Sold QR (Fake Resale)
           </button>
         </div>
 
@@ -379,12 +390,13 @@ export const VerifyPortal: React.FC<VerifyPortalProps> = ({
               {activeVerification.pack && activeVerification.batch && (
                 <div className="flex flex-row sm:flex-col items-center sm:items-end gap-2 shrink-0">
                   <QRCodeMatrix
-                    value={buildGS1DigitalLink(
-                      activeVerification.batch.productCode,
-                      activeVerification.pack.serialNumber,
-                      activeVerification.pack.signature
+                    value={buildPhoneScannableQRCertificate(
+                      activeVerification.pack,
+                      activeVerification.batch,
+                      undefined,
+                      { format: 'PHONE_CERTIFICATE' }
                     )}
-                    size={96}
+                    size={132}
                     label={activeVerification.pack.serialNumber}
                     allowDownload={true}
                   />
@@ -524,6 +536,27 @@ export const VerifyPortal: React.FC<VerifyPortalProps> = ({
                             : `Genuine · 256-bit PUF Matched`}
                         </span>
                       </div>
+                      {activeVerification.telemetryHistory.length > 0 && (
+                        <div>
+                          <span className="text-slate-400 block font-sans">
+                            Cold-Chain Blockchain Seal
+                          </span>
+                          <span
+                            className={
+                              activeVerification.telemetryHistory.some((t) => t.isBreached)
+                                ? 'text-rose-400'
+                                : 'text-emerald-300'
+                            }
+                          >
+                            Block #{activeVerification.telemetryHistory[0].blockIndex ?? '—'} ·{' '}
+                            {activeVerification.telemetryHistory[0].temperature.toFixed(1)}°C (
+                            {activeVerification.telemetryHistory[0].blockHash
+                              ? `${activeVerification.telemetryHistory[0].blockHash.slice(0, 10)}...`
+                              : 'Sealed'}
+                            )
+                          </span>
+                        </div>
+                      )}
                       <div className="sm:col-span-2 text-[11px] text-slate-400 pt-2 border-t border-slate-800">
                         Verification method: {formatSignatureMethodLabel(lastVerifyMeta.signatureMethod)} ·{' '}
                         {lastVerifyMeta.verifiedOffline ? 'Offline Cache' : 'Live Ledger'}

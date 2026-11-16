@@ -44,6 +44,11 @@ import {
   createSelectiveDisclosureVC,
   verifySelectiveDisclosureVC,
   analyzeCustodyGraphDiversion,
+  sealTelemetryEventChain,
+  sealTelemetrySequence,
+  buildTelemetryHashChain,
+  traceSupplyChainStageForensics,
+  buildPhoneScannableQRCertificate,
   BatchRecord,
   MedicinePackRecord,
   TelemetryEvent,
@@ -1003,6 +1008,364 @@ test('Expanded RBAC strictly restricts MANAGE_PARTICIPANTS, LEDGER_RESET, OPERAT
   assert.equal(canRoleExecuteAction('DISTRIBUTOR', 'INGEST_TELEMETRY').allowed, true);
 });
 
+test('Cold-chain telemetry blockchain seals readings with Keccak-256 links and cascades tamper invalidation on 0.1°C mutation', () => {
+  const rawReadings: TelemetryEvent[] = [
+    {
+      id: 'tel-a',
+      batchId: '0xbatch-chain',
+      temperature: 4.1,
+      humidity: 44,
+      latitude: 42.36,
+      longitude: -71.05,
+      locationLabel: 'Manufacturer Vault',
+      deviceId: 'IOT-01',
+      timestamp: '2026-11-15T08:00:00.000Z',
+      isBreached: false,
+      signerAddress: '0x1111111111111111111111111111111111111111',
+    },
+    {
+      id: 'tel-b',
+      batchId: '0xbatch-chain',
+      temperature: -1.5,
+      humidity: 48,
+      latitude: 41.87,
+      longitude: -87.62,
+      locationLabel: 'Transit Reefer',
+      deviceId: 'IOT-02',
+      timestamp: '2026-11-15T09:00:00.000Z',
+      isBreached: true,
+      breachType: 'SUBCOOLING',
+      signerAddress: '0x1111111111111111111111111111111111111111',
+    },
+    {
+      id: 'tel-c',
+      batchId: '0xbatch-chain',
+      temperature: 4.4,
+      humidity: 45,
+      latitude: 42.36,
+      longitude: -71.05,
+      locationLabel: 'Pharmacy Vault',
+      deviceId: 'IOT-03',
+      timestamp: '2026-11-15T10:00:00.000Z',
+      isBreached: false,
+      signerAddress: '0x1111111111111111111111111111111111111111',
+    },
+  ];
 
+  // Subcooling check
+  const sub = evaluateColdChainReading(-1.5, 2.0, 8.0);
+  assert.equal(sub.isBreached, true);
+  assert.equal(sub.breachType, 'SUBCOOLING');
+
+  const sealed = sealTelemetrySequence(rawReadings);
+  const appended = sealTelemetryEventChain(
+    {
+      id: 'tel-d',
+      batchId: '0xbatch-chain',
+      temperature: 5.0,
+      humidity: 45,
+      latitude: 42.36,
+      longitude: -71.05,
+      locationLabel: 'Dispense Check',
+      deviceId: 'IOT-04',
+      timestamp: '2026-11-15T11:00:00.000Z',
+      isBreached: false,
+      signerAddress: '0x1111111111111111111111111111111111111111',
+    },
+    sealed
+  );
+  const fullChainInput = [appended, ...sealed];
+  const validCheck = buildTelemetryHashChain(fullChainInput);
+  assert.equal(validCheck.allValid, true);
+  assert.equal(validCheck.totalBlocks, 4);
+  assert.equal(validCheck.brokenCount, 0);
+
+  // Tamper block #2 ('tel-b') by changing -1.5°C to fake safe 4.2°C -> blocks #2, #3, #4 must all fail
+  const tamperedCheck = buildTelemetryHashChain(fullChainInput, { id: 'tel-b', temperature: 4.2 });
+  assert.equal(tamperedCheck.allValid, false);
+  assert.equal(tamperedCheck.firstBrokenBlockIndex, 2);
+  assert.equal(tamperedCheck.brokenCount, 3);
+});
+
+test('Already-dispensed pack is immediately blocked with ALREADY_DISPENSED on the very first customer verification scan', () => {
+  const batch: BatchRecord = {
+    batchId: '0xbatch-disp',
+    batchCode: 'BATCH-DISP-2026',
+    productCode: 'NDC-0069-4210-01',
+    brandName: 'Insulin Cold Vial',
+    genericName: 'Insulin',
+    dosageForm: 'Vial',
+    strength: '100 U/mL',
+    totalPacks: 10,
+    packsRegistered: 1,
+    minTemp: 2,
+    maxTemp: 8,
+    manufacturedAt: '2026-01-01T00:00:00.000Z',
+    expiresAt: '2028-01-01T00:00:00.000Z',
+    manufacturerName: 'Pfizer BioTech Labs',
+    manufacturerAddress: MANUFACTURER_PUBLIC_ADDRESS,
+    isQuarantined: false,
+    isRecalled: false,
+    txHash: '0xtx',
+  };
+
+  const soldPackFirstCustomerScan: MedicinePackRecord = {
+    serialNumber: 'SN-SOLD-0001',
+    serialHash: computeKeccakHex('SN-SOLD-0001'),
+    batchId: '0xbatch-disp',
+    tokenId: 1,
+    status: 'DISPENSED',
+    currentCustodian: 'Patient (RX-2026-88412)',
+    custodianRole: 'PATIENT',
+    nonce: '0x1',
+    signature: '0xsig',
+    scanCount: 1, // First scan after pharmacy sold it!
+    isSuspicious: false,
+    dispensedAt: '2026-11-15T10:00:00.000Z',
+    dispensedToReceipt: computeKeccakHex('zk-receipt-1'),
+  };
+
+  const result = evaluatePackVerification(
+    soldPackFirstCustomerScan,
+    batch,
+    [],
+    [],
+    '2026-11-15T10:05:00.000Z'
+  );
+  assert.equal(result.outcome, 'ALREADY_DISPENSED');
+  assert.equal(result.isAuthentic, false);
+  assert.equal(result.aiAssessment.riskLevel === 'HIGH' || result.aiAssessment.riskLevel === 'CRITICAL', true);
+});
+
+test('traceSupplyChainStageForensics pinpoints Distributor temperature drop, Pharmacy resale, broker diversion, and forged QR to exact stage and place', () => {
+  const batchId = computeKeccakHex('LOT-FORENSIC-2026');
+  const serialNumber = 'SN-FORENSIC-0001';
+  const serialHash = computeKeccakHex(serialNumber);
+  const batch: BatchRecord = {
+    batchId,
+    batchCode: 'LOT-FORENSIC-2026',
+    productCode: 'NDC-0069-4210-01',
+    brandName: 'Insulin Cold Vial',
+    genericName: 'Insulin',
+    dosageForm: 'Vial',
+    strength: '100 U/mL',
+    totalPacks: 100,
+    packsRegistered: 1,
+    minTemp: 2.0,
+    maxTemp: 8.0,
+    manufacturedAt: '2026-11-15T01:00:00.000Z',
+    expiresAt: '2027-11-15T01:00:00.000Z',
+    manufacturerName: 'Pfizer BioTech Manufacturing',
+    manufacturerAddress: MANUFACTURER_PUBLIC_ADDRESS,
+    isQuarantined: false,
+    isRecalled: false,
+    txHash: '0xtx-mfg',
+  };
+
+  const basePack: MedicinePackRecord = {
+    serialNumber,
+    serialHash,
+    batchId,
+    tokenId: 1,
+    status: 'IN_TRANSIT',
+    currentCustodian: 'Apex Cold-Chain Logistics',
+    custodianRole: 'DISTRIBUTOR',
+    nonce: '0x1',
+    signature: '0xsig-valid',
+    scanCount: 0,
+    isSuspicious: false,
+    lastScannedLocation: 'Chicago O’Hare Cold Hub, Chicago, IL',
+  };
+
+  const custodyEvents: CustodyEvent[] = [
+    {
+      id: 'c-dist',
+      serialHash,
+      batchId,
+      fromActor: 'Pfizer BioTech Manufacturing',
+      toActor: 'Apex Cold-Chain Logistics',
+      action: 'TRANSFER_DISTRIBUTOR',
+      location: 'Chicago O’Hare Cold Hub, Chicago, IL',
+      timestamp: '2026-11-15T02:00:00.000Z',
+      notes: 'Shipped to distributor',
+      txHash: '0xtx-dist',
+    },
+    {
+      id: 'c-mfg',
+      serialHash,
+      batchId,
+      fromActor: '0x0000...0000 (Genesis)',
+      toActor: 'Pfizer BioTech Manufacturing',
+      action: 'MINT_GENESIS',
+      location: 'Kalamazoo Sterile Plant, Kalamazoo, MI',
+      timestamp: '2026-11-15T01:00:00.000Z',
+      notes: 'Minted genesis pack',
+      txHash: '0xtx-mfg',
+    },
+  ];
+
+  const telemetryWithDistDrop = sealTelemetrySequence([
+    {
+      id: 't-mfg',
+      batchId,
+      temperature: 4.2,
+      humidity: 48,
+      latitude: 42.29,
+      longitude: -85.58,
+      locationLabel: 'Kalamazoo Sterile Plant, Kalamazoo, MI',
+      deviceId: 'MFG-VAULT-PROBE-01',
+      timestamp: '2026-11-15T01:00:00.000Z',
+      isBreached: false,
+    },
+    {
+      id: 't-dist-drop',
+      batchId,
+      temperature: -1.5,
+      humidity: 66,
+      latitude: 41.87,
+      longitude: -87.62,
+      locationLabel: 'Chicago O’Hare Cold Hub, Chicago, IL',
+      deviceId: 'DIST-REEFER-PROBE-02',
+      timestamp: '2026-11-15T02:00:00.000Z',
+      isBreached: true,
+      breachType: 'SUBCOOLING',
+    },
+  ]);
+
+  // 1. Distributor temperature drop is pinpointed to DISTRIBUTOR stage & Chicago O'Hare Cold Hub
+  const reportDistDrop = traceSupplyChainStageForensics(
+    basePack,
+    batch,
+    custodyEvents,
+    telemetryWithDistDrop
+  );
+  assert.equal(reportDistDrop.overallStatus, 'BLOCKED_TEMP_BREACH');
+  assert.equal(reportDistDrop.stages[0].stageStatus, 'VERIFIED');
+  assert.equal(reportDistDrop.stages[1].stageStatus, 'TEMP_BREACH_ORIGIN');
+  assert.equal(reportDistDrop.violations[0].category, 'TEMPERATURE_DROP');
+  assert.equal(reportDistDrop.violations[0].detectedAtStage, 'DISTRIBUTOR');
+  assert.equal(
+    reportDistDrop.violations[0].culpritLocation,
+    'Chicago O’Hare Cold Hub, Chicago, IL'
+  );
+
+  // 2. Dispensed pack resold at Pharmacy is pinpointed to PHARMACY stage & Boston location
+  const soldPack: MedicinePackRecord = {
+    ...basePack,
+    status: 'DISPENSED',
+    currentCustodian: 'Patient (RX-2026-88412)',
+    custodianRole: 'PATIENT',
+    dispensedAt: '2026-11-15T04:00:00.000Z',
+    dispensedToReceipt: computeKeccakHex('zk-receipt-forensic'),
+  };
+  const custodyWithSale: CustodyEvent[] = [
+    {
+      id: 'c-sale',
+      serialHash,
+      batchId,
+      fromActor: 'City Central Hospital Pharmacy',
+      toActor: 'Patient (RX-2026-88412)',
+      action: 'DISPENSED_TO_PATIENT',
+      location: 'Boston Medical Receiving Vault, Boston, MA',
+      timestamp: '2026-11-15T04:00:00.000Z',
+      notes: 'Dispensed to patient',
+      txHash: '0xtx-sale',
+    },
+    ...custodyEvents,
+  ];
+  const reportResold = traceSupplyChainStageForensics(
+    soldPack,
+    batch,
+    custodyWithSale,
+    telemetryWithDistDrop
+  );
+  assert.equal(reportResold.overallStatus, 'BLOCKED_RESOLD_QR');
+  assert.equal(reportResold.stages[2].stageStatus, 'RESOLD_LOCKED_ORIGIN');
+  assert.equal(
+    reportResold.violations.some(
+      (v) =>
+        v.category === 'PREVIOUSLY_SOLD_RESALE' &&
+        v.detectedAtStage === 'PHARMACY' &&
+        v.culpritActor === 'City Central Hospital Pharmacy'
+    ),
+    true
+  );
+
+  // 3. Forged QR signature scan is flagged as BLOCKED_COUNTERFEIT
+  const reportForged = traceSupplyChainStageForensics(
+    basePack,
+    batch,
+    custodyEvents,
+    [telemetryWithDistDrop[1]],
+    { signatureTampered: true }
+  );
+  assert.equal(reportForged.overallStatus, 'BLOCKED_COUNTERFEIT');
+  assert.equal(reportForged.violations[0].category, 'COUNTERFEIT_QR_SIGNATURE');
+});
+
+test('buildPhoneScannableQRCertificate generates human-readable certificate, mobile web URL, and round-trips through parseQRScanInput', () => {
+  const batchId = computeKeccakHex('BATCH-QR-CERT-2026');
+  const serialNumber = 'SN-QRCERT-2026-0009';
+  const serialHash = computeKeccakHex(serialNumber);
+  const nonce = '0x9988776655443322';
+  const expiresAt = '2028-12-31T00:00:00.000Z';
+  const signature = signQRPayload(serialNumber, batchId, expiresAt, nonce);
+
+  const pack: MedicinePackRecord = {
+    serialNumber,
+    serialHash,
+    batchId,
+    tokenId: 9,
+    status: 'IN_TRANSIT',
+    currentCustodian: 'Apex Cold-Chain Logistics',
+    custodianRole: 'DISTRIBUTOR',
+    lastScannedLocation: 'Chicago O’Hare Cold Hub, Chicago, IL',
+    nonce,
+    signature,
+    scanCount: 1,
+    isSuspicious: false,
+  };
+  const batch: BatchRecord = {
+    batchId,
+    batchCode: 'BATCH-QR-CERT-2026',
+    productCode: '00300099999001',
+    brandName: 'Comirnaty mRNA Vial',
+    genericName: 'Tozinameran mRNA',
+    dosageForm: 'Vial',
+    strength: '30 mcg/0.3 mL',
+    totalPacks: 100,
+    packsRegistered: 1,
+    minTemp: 2,
+    maxTemp: 8,
+    manufacturedAt: '2026-11-15T01:00:00.000Z',
+    expiresAt,
+    manufacturerName: 'Pfizer BioTech Manufacturing',
+    manufacturerAddress: MANUFACTURER_PUBLIC_ADDRESS,
+    isQuarantined: false,
+    isRecalled: false,
+    txHash: '0xtx-mfg-qr',
+  };
+
+  // 1. Human-readable Phone Certificate text has no colon URI prefix and round-trips
+  const certText = buildPhoneScannableQRCertificate(pack, batch, undefined, {
+    format: 'PHONE_CERTIFICATE',
+  });
+  assert.equal(certText.includes('MEDSUPPLY SENTINEL CERTIFICATE'), true);
+  assert.equal(certText.includes(`Pack Serial: ${serialNumber}`), true);
+  assert.equal(certText.includes('Medicine - Comirnaty mRNA Vial'), true);
+  const parsedCert = parseQRScanInput(certText);
+  assert.equal(parsedCert.serialNumber, serialNumber);
+  assert.equal(parsedCert.providedSignature?.toLowerCase(), signature.toLowerCase());
+
+  // 2. Mobile Web Link (/qr-verify) round-trips
+  const webLink = buildPhoneScannableQRCertificate(pack, batch, undefined, {
+    format: 'MOBILE_WEB_LINK',
+    baseOriginUrl: 'http://localhost:3000',
+  });
+  assert.equal(webLink.startsWith('http://localhost:3000/qr-verify?serial='), true);
+  const parsedWeb = parseQRScanInput(webLink);
+  assert.equal(parsedWeb.serialNumber, serialNumber);
+  assert.equal(parsedWeb.providedSignature?.toLowerCase(), signature.toLowerCase());
+});
 
 

@@ -15,6 +15,7 @@ import {
   deriveDeterministicPUFPrint,
   splitSecretShamir,
   sealShamirSharesECIES,
+  sealTelemetrySequence,
 } from './sentinelLogic';
 
 const BATCH_1_ID = computeKeccakHex('BATCH-PCV-2026');
@@ -313,7 +314,7 @@ export const INITIAL_CUSTODY_EVENTS: CustodyEvent[] = [
   },
 ];
 
-export const INITIAL_TELEMETRY: TelemetryEvent[] = [
+export const INITIAL_TELEMETRY: TelemetryEvent[] = sealTelemetrySequence([
   {
     id: 'tel-1',
     batchId: BATCH_1_ID,
@@ -325,7 +326,7 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     deviceId: 'IOT-DHT22-901',
     timestamp: '2026-11-12T01:00:00.000Z',
     isBreached: false,
-    txHash: '0x1122aabbccdd',
+    signerAddress: '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
   },
   {
     id: 'tel-2',
@@ -338,7 +339,7 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     deviceId: 'IOT-DHT22-901',
     timestamp: '2026-11-12T02:30:00.000Z',
     isBreached: false,
-    txHash: '0x2233bbccddee',
+    signerAddress: '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
   },
   {
     id: 'tel-3',
@@ -351,7 +352,7 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     deviceId: 'IOT-DHT22-901',
     timestamp: '2026-11-12T03:45:00.000Z',
     isBreached: false,
-    txHash: '0x2839aabbccdd',
+    signerAddress: '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
   },
   {
     id: 'tel-4',
@@ -364,7 +365,7 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     deviceId: 'IOT-DHT22-901',
     timestamp: '2026-11-12T05:00:00.000Z',
     isBreached: false,
-    txHash: '0x3344ccddeeff',
+    signerAddress: '0xa0Ee7A142d267C1f36714E4a8F75612F20a79720',
   },
   {
     id: 'tel-5',
@@ -377,7 +378,7 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     deviceId: 'IOT-DHT22-404',
     timestamp: '2026-11-12T01:15:00.000Z',
     isBreached: false,
-    txHash: '0x4455ddeeff00',
+    signerAddress: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
   },
   {
     id: 'tel-6',
@@ -391,9 +392,9 @@ export const INITIAL_TELEMETRY: TelemetryEvent[] = [
     timestamp: '2026-11-12T04:45:00.000Z',
     isBreached: true,
     breachType: 'OVERHEATING',
-    txHash: '0x99887766554433221100aabbccddeeff',
+    signerAddress: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
   },
-];
+]);
 
 export const INITIAL_ADVERSE_REPORTS: PatientAdverseReport[] = [
   {

@@ -129,3 +129,71 @@ export async function relayToEvmIfDeployed(
     };
   }
 }
+
+const COLDCHAIN_ORACLE_ABI = parseAbi([
+  'function recordTelemetry(bytes32 batchId, int16 temperature, uint16 humidity, int32 latitude, int32 longitude, uint256 timestamp, string deviceId) external returns (bool)',
+]);
+
+export async function relayColdChainTelemetryIfDeployed(params: {
+  batchId: string;
+  temperature: number;
+  humidity: number;
+  latitude: number;
+  longitude: number;
+  timestampIso: string;
+  deviceId: string;
+}): Promise<EvmRelayResult> {
+  const rpcUrl = process.env.RPC_URL || 'http://127.0.0.1:8545';
+  const oracleAddress = (process.env.COLDCHAIN_ORACLE_ADDRESS ||
+    '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512') as `0x${string}`;
+  try {
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl, { timeout: 400, retryCount: 0 }),
+    });
+    const code = await publicClient.getCode({ address: oracleAddress });
+    if (!code || code === '0x') {
+      return {
+        evmAnchored: false,
+        mode: 'LIVE_EVM_RPC_NO_BYTECODE',
+        contractAddress: oracleAddress,
+      };
+    }
+
+    const account = privateKeyToAccount(getRelayerKey());
+    const walletClient = createWalletClient({
+      account,
+      chain: foundry,
+      transport: http(rpcUrl, { timeout: 2500, retryCount: 0 }),
+    });
+
+    const unixTs = BigInt(Math.floor(new Date(params.timestampIso).getTime() / 1000));
+    const txHash = await walletClient.writeContract({
+      address: oracleAddress,
+      abi: COLDCHAIN_ORACLE_ABI,
+      functionName: 'recordTelemetry',
+      args: [
+        params.batchId as `0x${string}`,
+        Math.round(params.temperature * 100),
+        Math.round(params.humidity * 100),
+        Math.round(params.latitude * 1e6),
+        Math.round(params.longitude * 1e6),
+        unixTs,
+        params.deviceId,
+      ],
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 4000 });
+    return {
+      evmAnchored: receipt.status === 'success',
+      mode: 'LIVE_EVM_CONTRACT',
+      txHash,
+      blockNumber: receipt.blockNumber.toString(),
+      contractAddress: oracleAddress,
+    };
+  } catch {
+    return {
+      evmAnchored: false,
+      mode: 'SQLITE_WAL_SANDBOX',
+      contractAddress: oracleAddress,
+    };
+  }
+}

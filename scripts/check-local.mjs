@@ -10,7 +10,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const QUIET = process.argv.includes('--quiet');
 
 const REQUIRED_MAJOR = 22;
-const REQUIRED_MINOR = 13;
+const REQUIRED_MINOR = 5;
 
 function parseSemver(version) {
   const [major = 0, minor = 0, patch = 0] = version
@@ -40,7 +40,14 @@ async function run() {
   const nodeVersion = process.version;
   let hasError = false;
 
-  if (!isNodeSupported(nodeVersion)) {
+  // Check built-in node:sqlite directly
+  try {
+    const sqlite = await import('node:sqlite');
+    if (!sqlite.DatabaseSync) throw new Error('DatabaseSync missing');
+    if (!QUIET) {
+      console.log(`[OK] Node.js ${nodeVersion} with built-in node:sqlite WAL engine available`);
+    }
+  } catch (err) {
     hasError = true;
     console.error(`\n[MedSupply Sentinel] Unsupported Node.js version: ${nodeVersion}`);
     console.error(
@@ -50,18 +57,9 @@ async function run() {
     console.error('  Windows (PowerShell):  winget install OpenJS.NodeJS.LTS');
     console.error('  macOS (Homebrew):      brew install node@22');
     console.error('  Linux / nvm:           nvm install 22 && nvm use 22\n');
-  } else if (!QUIET) {
-    console.log(`[OK] Node.js ${nodeVersion} (>= v${REQUIRED_MAJOR}.${REQUIRED_MINOR}.0)`);
-  }
-
-  // Check built-in node:sqlite
-  try {
-    const sqlite = await import('node:sqlite');
-    if (!sqlite.DatabaseSync) throw new Error('DatabaseSync missing');
-    if (!QUIET) console.log('[OK] Built-in node:sqlite WAL engine available');
-  } catch (err) {
-    hasError = true;
-    console.error(`[FAIL] Built-in node:sqlite could not be loaded: ${String(err)}`);
+    if (!isNodeSupported(nodeVersion)) {
+      console.error(`[FAIL] Built-in node:sqlite could not be loaded: ${String(err)}`);
+    }
   }
 
   // Check data directory writeability

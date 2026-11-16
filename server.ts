@@ -10,7 +10,6 @@ import {
   RecallProposalRecord,
   MedicinePackRecord,
   CustodyEvent,
-  TelemetryEvent,
   PatientAdverseReport,
   ParticipantEntity,
   PalletContainerRecord,
@@ -33,6 +32,9 @@ import {
   splitSecretShamir,
   sealShamirSharesECIES,
   reconstructSecretShamir,
+  sealTelemetryEventChain,
+  buildTelemetryHashChain,
+  traceSupplyChainStageForensics,
   ShamirShareRecord,
   PUFMatchResult,
   MANUFACTURER_PUBLIC_ADDRESS,
@@ -45,7 +47,11 @@ import {
   verifyCommandEIP712,
   SignedCommandEnvelope,
 } from './server/cryptoIssuer.ts';
-import { probeLiveEvmNode, relayToEvmIfDeployed } from './server/evmRelay.ts';
+import {
+  probeLiveEvmNode,
+  relayToEvmIfDeployed,
+  relayColdChainTelemetryIfDeployed,
+} from './server/evmRelay.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,14 +96,27 @@ async function startServer() {
   // Real-time Server-Sent Events (SSE) clients
   const sseClients = new Set<express.Response>();
 
-  // Healthcheck endpoint for local startup verification
+  // Unified Health & Infrastructure Capabilities Endpoint
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
-      status: 'healthy',
+      status: 'ok',
       nodeVersion: process.version,
-      ledgerVersion: ledgerState.version,
+      persistence: 'sqlite-wal-acid',
       dbPath: 'data/medsupply-sentinel.db',
+      version: ledgerState.version,
+      ledgerVersion: ledgerState.version,
+      issuerPublicAddress: getIssuerPublicAddress(),
+      sseSubscribers: sseClients.size,
+      lastUpdatedAt: ledgerState.lastUpdatedAt,
+      counts: {
+        batches: ledgerState.batches.length,
+        packs: ledgerState.packs.length,
+        pallets: ledgerState.pallets.length,
+        custodyEvents: ledgerState.custodyEvents.length,
+        telemetry: ledgerState.telemetry.length,
+        auditEntries: ledgerState.auditLog.length,
+      },
     });
   });
 
@@ -140,26 +159,6 @@ async function startServer() {
     req.on('close', () => {
       clearInterval(heartbeat);
       sseClients.delete(res);
-    });
-  });
-
-  // Health & Infrastructure Capabilities Endpoint
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      persistence: 'sqlite-wal-acid',
-      version: ledgerState.version,
-      issuerPublicAddress: getIssuerPublicAddress(),
-      sseSubscribers: sseClients.size,
-      lastUpdatedAt: ledgerState.lastUpdatedAt,
-      counts: {
-        batches: ledgerState.batches.length,
-        packs: ledgerState.packs.length,
-        pallets: ledgerState.pallets.length,
-        custodyEvents: ledgerState.custodyEvents.length,
-        telemetry: ledgerState.telemetry.length,
-        auditEntries: ledgerState.auditLog.length,
-      },
     });
   });
 
@@ -219,6 +218,19 @@ async function startServer() {
     res.json({
       version: ledgerState.version,
       items: ledgerState.auditLog,
+    });
+  });
+
+  // Cold-Chain Telemetry Blockchain Integrity Verification Endpoint
+  app.get('/api/cold-chain/integrity', (_req, res) => {
+    const verification = buildTelemetryHashChain(ledgerState.telemetry);
+    res.json({
+      ok: verification.allValid,
+      totalBlocks: verification.totalBlocks,
+      brokenCount: verification.brokenCount,
+      firstBrokenBlockIndex: verification.firstBrokenBlockIndex,
+      latestBlockHash: verification.latestBlockHash,
+      appendOnlySqliteTriggers: true,
     });
   });
 
@@ -316,6 +328,7 @@ async function startServer() {
       const nextState: PersistentLedgerState = structuredClone(ledgerState);
       let auditSummary = `${actionParam} executed by ${signerAddr}`;
       let sseEventName = 'ledger_updated';
+      let sseExtra: Record<string, unknown> = {};
       let extraResult: Record<string, unknown> = {};
 
       const assertRole = (rbacAction: Parameters<typeof canRoleExecuteAction>[1]) => {
@@ -428,9 +441,34 @@ async function startServer() {
           );
           const estHours = Math.max(Math.round((distInfo.distanceKm / 85) * 10) / 10, 2.5);
 
+          const initialTempVal =
+            p.initialTemp !== undefined && !Number.isNaN(Number(p.initialTemp))
+              ? Number(p.initialTemp)
+              : Number(((minTemp + maxTemp) / 2).toFixed(1));
+          const initialEval = evaluateColdChainReading(initialTempVal, minTemp, maxTemp);
+          const mfgSealedTelemetry = sealTelemetryEventChain(
+            {
+              id: `tel-mfg-${Date.now()}`,
+              batchId,
+              temperature: initialTempVal,
+              humidity: initialEval.isBreached ? 66.0 : 48.0,
+              latitude: originHub.coordinates[1],
+              longitude: originHub.coordinates[0],
+              locationLabel: `${originHub.name}, ${originHub.cityState}`,
+              deviceId: 'MFG-VAULT-PROBE-01',
+              timestamp: nowIso,
+              isBreached: initialEval.isBreached,
+              breachType: initialEval.breachType,
+              txHash,
+              signerAddress: signerAddr,
+            },
+            nextState.telemetry
+          );
+
           nextState.batches = [createdBatch, ...nextState.batches];
           nextState.packs = [initialPack, ...nextState.packs];
           nextState.custodyEvents = [genesisCustody, ...nextState.custodyEvents];
+          nextState.telemetry = [mfgSealedTelemetry, ...nextState.telemetry];
           nextState.transitCorridors = [
             {
               id: `route-${Date.now()}`,
@@ -459,12 +497,12 @@ async function startServer() {
                 }
               : h
           );
-          auditSummary = `Minted batch ${batchCode} + ECDSA QR genesis pack ${firstSerial}`;
+          auditSummary = `Minted batch ${batchCode} + ECDSA QR genesis pack ${firstSerial} (${initialTempVal.toFixed(1)}°C at ${originHub.name})`;
           const mintEvmRelay = await relayToEvmIfDeployed('anchorPackPufSeal', [
             firstHash,
             initialPack.pufSealHash!,
           ]);
-          extraResult = { createdBatch, firstSerial, evmRelay: mintEvmRelay };
+          extraResult = { createdBatch, firstSerial, evmRelay: mintEvmRelay, mfgTelemetry: mfgSealedTelemetry };
           break;
         }
 
@@ -703,7 +741,24 @@ async function startServer() {
             }
           }
 
+          const simulateBrokerDiversion = Boolean(p.simulateUnauthorizedBroker);
           nextState.custodyEvents = [
+            ...(simulateBrokerDiversion
+              ? [
+                  {
+                    id: `cust-brk-${Date.now()}`,
+                    serialHash: targetPack.serialHash,
+                    batchId: targetPack.batchId,
+                    fromActor: nextCustodian,
+                    toActor: 'GreyMarket Unlicensed Broker LLC',
+                    action: 'UNAUTHORIZED_BROKER_DIVERSION',
+                    location: locationLabel,
+                    timestamp: nowIso,
+                    notes: `ALERT: Unlicensed grey-market broker custody diversion detected at ${locationLabel} during ${actionName}`,
+                    txHash: computeKeccakHex(`broker-divert:${serialNumber}:${Date.now()}`).slice(0, 66),
+                  },
+                ]
+              : []),
             {
               id: `cust-${Date.now()}`,
               serialHash: targetPack.serialHash,
@@ -716,13 +771,21 @@ async function startServer() {
               notes:
                 targetStatus === 'DISPENSED' && zkReceiptCommitment
                   ? `${String(p.extraNotes || 'Dispensed to patient')} · ZK Commitment ${zkReceiptCommitment.slice(0, 14)}...`
+                  : p.handoverTemp !== undefined && !Number.isNaN(Number(p.handoverTemp))
+                  ? `${String(p.extraNotes || `Verified cryptographic custody handover (${actionName})`)} · Assigned Temp ${Number(p.handoverTemp).toFixed(1)}°C at ${locationLabel}`
                   : String(p.extraNotes || `Verified cryptographic custody handover (${actionName})`),
               txHash,
             },
             ...nextState.custodyEvents,
           ];
 
-          if (actionName === 'TRANSFER_PHARMACY' && p.handoverTemp !== undefined && parentBatch) {
+          if (simulateBrokerDiversion) {
+            nextState.packs = nextState.packs.map((pk) =>
+              pk.serialNumber === serialNumber ? { ...pk, isSuspicious: true } : pk
+            );
+          }
+
+          if (p.handoverTemp !== undefined && parentBatch) {
             const parsedTemp = Number(p.handoverTemp);
             if (!Number.isNaN(parsedTemp)) {
               const evalResult = evaluateColdChainReading(
@@ -730,7 +793,13 @@ async function startServer() {
                 parentBatch.minTemp,
                 parentBatch.maxTemp
               );
-              nextState.telemetry = [
+              const stageDeviceId =
+                actionName === 'TRANSFER_DISTRIBUTOR'
+                  ? 'DIST-REEFER-PROBE-02'
+                  : actionName === 'TRANSFER_PHARMACY'
+                  ? 'PHARM-VAULT-PROBE-04'
+                  : 'HANDOVER-PROBE-04';
+              const sealedProbe = sealTelemetryEventChain(
                 {
                   id: `tel-${Date.now()}`,
                   batchId: parentBatch.batchId,
@@ -739,14 +808,45 @@ async function startServer() {
                   latitude: matchedHub ? matchedHub.coordinates[1] : 42.3601,
                   longitude: matchedHub ? matchedHub.coordinates[0] : -71.0589,
                   locationLabel,
-                  deviceId: 'HANDOVER-PROBE-04',
+                  deviceId: stageDeviceId,
                   timestamp: nowIso,
                   isBreached: evalResult.isBreached,
                   breachType: evalResult.breachType,
                   txHash,
+                  signerAddress: signerAddr,
                 },
-                ...nextState.telemetry,
-              ];
+                nextState.telemetry
+              );
+              nextState.telemetry = [sealedProbe, ...nextState.telemetry];
+              if (evalResult.isBreached) {
+                sseEventName = 'excursion_alert';
+                sseExtra = {
+                  temperature: parsedTemp,
+                  breachType: evalResult.breachType,
+                  batchCode: parentBatch.batchCode,
+                  minTemp: parentBatch.minTemp,
+                  maxTemp: parentBatch.maxTemp,
+                  blockHash: sealedProbe.blockHash,
+                };
+                nextState.custodyEvents = [
+                  {
+                    id: `cust-hbr-${Date.now()}`,
+                    serialHash: targetPack.serialHash,
+                    batchId: parentBatch.batchId,
+                    fromActor: `${stageDeviceId} (${nextCustodian})`,
+                    toActor: locationLabel,
+                    action:
+                      evalResult.breachType === 'SUBCOOLING'
+                        ? 'COLD_CHAIN_SUBCOOLING_ALERT'
+                        : 'COLD_CHAIN_OVERHEAT_ALERT',
+                    location: locationLabel,
+                    timestamp: nowIso,
+                    notes: `Handover Cold-Chain Breach at ${locationLabel} (${nextCustodian}): ${parsedTemp.toFixed(1)}°C violated safe range ${parentBatch.minTemp}°C–${parentBatch.maxTemp}°C · Sealed on Block #${sealedProbe.blockIndex}`,
+                    txHash: (sealedProbe.blockHash || txHash).slice(0, 66),
+                  },
+                  ...nextState.custodyEvents,
+                ];
+              }
             }
           }
 
@@ -947,28 +1047,42 @@ async function startServer() {
           const targetHub =
             nextState.logisticsHubs.find((h) => h.id === hubId) || nextState.logisticsHubs[0];
           const evaluation = evaluateColdChainReading(tempVal, batch.minTemp, batch.maxTemp);
-          const txHash = computeKeccakHex(`iot:${batch.batchCode}:${tempVal}:${Date.now()}`).slice(
-            0,
-            66
-          );
+          const humidityVal = evaluation.isBreached ? 68.5 : 54.0;
+          const locationStr = String(p.location || `${targetHub.name}, ${targetHub.cityState}`);
+          const deviceIdStr = String(p.deviceId || 'IOT-DHT22-901');
 
-          nextState.telemetry = [
+          const evmTelRelay = await relayColdChainTelemetryIfDeployed({
+            batchId: batch.batchId,
+            temperature: tempVal,
+            humidity: humidityVal,
+            latitude: targetHub.coordinates[1],
+            longitude: targetHub.coordinates[0],
+            timestampIso: nowIso,
+            deviceId: deviceIdStr,
+          });
+
+          const sealedTelemetry = sealTelemetryEventChain(
             {
               id: `tel-${Date.now()}`,
               batchId: batch.batchId,
               temperature: tempVal,
-              humidity: evaluation.isBreached ? 68.5 : 54.0,
+              humidity: humidityVal,
               latitude: targetHub.coordinates[1],
               longitude: targetHub.coordinates[0],
-              locationLabel: String(p.location || `${targetHub.name}, ${targetHub.cityState}`),
-              deviceId: String(p.deviceId || 'IOT-DHT22-901'),
+              locationLabel: locationStr,
+              deviceId: deviceIdStr,
               timestamp: nowIso,
               isBreached: evaluation.isBreached,
               breachType: evaluation.breachType,
-              txHash,
+              signerAddress: signerAddr,
+              ...(evmTelRelay.evmAnchored && evmTelRelay.txHash
+                ? { evmTxHash: evmTelRelay.txHash }
+                : {}),
             },
-            ...nextState.telemetry,
-          ];
+            nextState.telemetry
+          );
+
+          nextState.telemetry = [sealedTelemetry, ...nextState.telemetry];
 
           nextState.logisticsHubs = nextState.logisticsHubs.map((h) =>
             h.id === targetHub.id
@@ -980,7 +1094,7 @@ async function startServer() {
                     ? Math.max(h.dwellHours, h.maxSafeDwellHours + 6)
                     : h.dwellHours,
                   bottleneckReason: evaluation.isBreached
-                    ? `Cold-chain excursion (${tempVal.toFixed(1)}°C) recorded on ${batch.batchCode} at ${targetHub.name}`
+                    ? `Cold-chain ${evaluation.breachType === 'SUBCOOLING' ? 'subcooling freeze' : 'overheating'} excursion (${tempVal.toFixed(1)}°C) recorded on ${batch.batchCode} at ${targetHub.name}`
                     : h.bottleneckReason,
                 }
               : h
@@ -988,20 +1102,46 @@ async function startServer() {
 
           if (evaluation.isBreached) {
             sseEventName = 'excursion_alert';
+            sseExtra = {
+              temperature: tempVal,
+              breachType: evaluation.breachType,
+              batchCode: batch.batchCode,
+              minTemp: batch.minTemp,
+              maxTemp: batch.maxTemp,
+              blockHash: sealedTelemetry.blockHash,
+            };
             nextState.transitCorridors = nextState.transitCorridors.map((c) =>
               c.batchCode === batch.batchCode || c.toHubId === targetHub.id
                 ? {
                     ...c,
                     status: 'CRITICAL_BOTTLENECK',
                     actualHours: Math.max(c.actualHours, c.estimatedHours + 8),
-                    bottleneckDetail: `CRITICAL: ${tempVal.toFixed(1)}°C thermal excursion recorded at ${targetHub.cityState}.`,
+                    bottleneckDetail: `CRITICAL ${evaluation.breachType === 'SUBCOOLING' ? 'FREEZE' : 'HEAT'} BREACH: ${tempVal.toFixed(1)}°C recorded at ${targetHub.cityState} (Safe: ${batch.minTemp}°C–${batch.maxTemp}°C).`,
                   }
                 : c
             );
+            nextState.custodyEvents = [
+              {
+                id: `cust-temp-${Date.now()}`,
+                serialHash: sealedTelemetry.blockHash || batch.batchId,
+                batchId: batch.batchId,
+                fromActor: `${deviceIdStr} (Signed Sensor)`,
+                toActor: targetHub.name,
+                action:
+                  evaluation.breachType === 'SUBCOOLING'
+                    ? 'COLD_CHAIN_SUBCOOLING_ALERT'
+                    : 'COLD_CHAIN_OVERHEAT_ALERT',
+                location: locationStr,
+                timestamp: nowIso,
+                notes: `Immutable Telemetry Block #${sealedTelemetry.blockIndex}: ${tempVal.toFixed(1)}°C breached safe limit (${batch.minTemp}°C–${batch.maxTemp}°C)`,
+                txHash: (sealedTelemetry.blockHash || batch.batchId).slice(0, 66),
+              },
+              ...nextState.custodyEvents,
+            ];
           }
 
-          auditSummary = `Telemetry ${tempVal.toFixed(1)}°C (${evaluation.isBreached ? 'BREACH' : 'SAFE'}) for ${batch.batchCode}`;
-          extraResult = { evaluation };
+          auditSummary = `Telemetry #${sealedTelemetry.blockIndex} ${tempVal.toFixed(1)}°C (${evaluation.isBreached ? evaluation.breachType : 'SAFE'}) for ${batch.batchCode}`;
+          extraResult = { evaluation, telemetryBlock: sealedTelemetry, evmRelay: evmTelRelay };
           break;
         }
 
@@ -1580,6 +1720,7 @@ async function startServer() {
         reason: actionParam,
         version: ledgerState.version,
         summary: auditSummary,
+        ...sseExtra,
       });
 
       return res.json({
@@ -1653,20 +1794,24 @@ async function startServer() {
       const evaluation = evaluateColdChainReading(body.temperature, batch.minTemp, batch.maxTemp);
       const nextState = structuredClone(ledgerState);
 
-      const newTel: TelemetryEvent = {
-        id: `tel-hw-${Date.now()}`,
-        batchId: batch.batchId,
-        temperature: body.temperature,
-        humidity,
-        latitude,
-        longitude,
-        locationLabel: `${hub.name}, ${hub.cityState} (HW ECDSA Verified)`,
-        deviceId: body.deviceId,
-        timestamp,
-        isBreached: evaluation.isBreached,
-        breachType: evaluation.breachType,
-        txHash: check.readingHash.slice(0, 66),
-      };
+      const newTel = sealTelemetryEventChain(
+        {
+          id: `tel-hw-${Date.now()}`,
+          batchId: batch.batchId,
+          temperature: body.temperature,
+          humidity,
+          latitude,
+          longitude,
+          locationLabel: `${hub.name}, ${hub.cityState} (HW ECDSA Verified)`,
+          deviceId: body.deviceId,
+          timestamp,
+          isBreached: evaluation.isBreached,
+          breachType: evaluation.breachType,
+          txHash: check.readingHash.slice(0, 66),
+          signerAddress: check.recoveredAddress,
+        },
+        nextState.telemetry
+      );
 
       nextState.telemetry = [newTel, ...nextState.telemetry];
       nextState.logisticsHubs = nextState.logisticsHubs.map((h) =>
@@ -1704,12 +1849,18 @@ async function startServer() {
         version: ledgerState.version,
         deviceId: body.deviceId,
         temperature: body.temperature,
+        breachType: evaluation.breachType,
+        batchCode: batch.batchCode,
+        minTemp: batch.minTemp,
+        maxTemp: batch.maxTemp,
+        blockHash: newTel.blockHash,
       });
 
       return res.json({
         ok: true,
         verifiedSensorAddress: check.recoveredAddress,
         readingHash: check.readingHash,
+        telemetryBlock: newTel,
         evaluation,
         state: ledgerState,
       });
@@ -1932,6 +2083,141 @@ async function startServer() {
       return res.status(500).json({ error: String(err) });
     }
   });
+
+  // Mobile Phone QR Scan Certificate Route (/qr-verify and GS1 /01/:gtin/21/:serial)
+  const renderMobileQrCertificate = (req: express.Request, res: express.Response) => {
+    const rawSerial = String(
+      req.params.serial || req.query.serial || req.query.verify || ''
+    ).trim();
+    const providedSig = String(req.query.sig || '').trim();
+    const pack = ledgerState.packs.find(
+      (p) => p.serialNumber.toLowerCase() === rawSerial.toLowerCase()
+    );
+    const batch = pack
+      ? ledgerState.batches.find((b) => b.batchId === pack.batchId)
+      : undefined;
+
+    const sigTampered = Boolean(
+      pack &&
+        providedSig &&
+        providedSig.toLowerCase() !== pack.signature.toLowerCase() &&
+        `0x${providedSig}`.toLowerCase() !== pack.signature.toLowerCase()
+    );
+
+    const queryVerdict = String(req.query.verdict || '');
+    const isExplicitResaleQuery = queryVerdict.toUpperCase().includes('RESOLD');
+
+    const forensic = traceSupplyChainStageForensics(
+      pack,
+      batch,
+      ledgerState.custodyEvents,
+      ledgerState.telemetry,
+      {
+        signatureTampered: sigTampered,
+        simulateResaleScan: queryVerdict
+          ? isExplicitResaleQuery
+          : Boolean(pack?.status === 'DISPENSED' && pack.scanCount > 1),
+      }
+    );
+
+    const brand = batch?.brandName || String(req.query.brand || 'Registered Pharmaceutical');
+    const batchCode = batch?.batchCode || String(req.query.batch || 'VERIFIED-BATCH');
+    const isSafe = pack ? forensic.overallStatus === 'AUTHENTIC_SAFE' : !req.query.verdict || String(req.query.verdict).includes('VERIFIED');
+    const headline = pack
+      ? forensic.headline
+      : String(req.query.verdict || `Medicine Pack ${rawSerial || 'Verification'}`);
+    const subheadline = pack
+      ? forensic.subheadline
+      : String(req.query.issue && req.query.issue !== 'None' ? req.query.issue : 'Cryptographic QR verification certificate');
+
+    const stagesHtml = pack
+      ? forensic.stages
+          .map((st) => {
+            const alert = st.stageStatus !== 'VERIFIED' && st.stageStatus !== 'PENDING';
+            const badgeColor = alert
+              ? '#fda4af;background:#4c0519;border:1px solid #be123c'
+              : st.stageStatus === 'VERIFIED'
+              ? '#6ee7b7;background:#022c22;border:1px solid #047857'
+              : '#94a3b8;background:#0f172a;border:1px solid #334155';
+            const tempStr =
+              st.recordedTempC !== undefined
+                ? `${st.recordedTempC.toFixed(1)}°C (Req: ${st.safeRangeLabel})`
+                : `Req: ${st.safeRangeLabel}`;
+            return `<div style="padding:12px;border-radius:10px;background:#020617;border:1px solid ${alert ? '#be123c' : '#1e293b'};margin-bottom:10px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
+                <strong style="color:#f8fafc;font-size:13px;">${st.stageTitle}</strong>
+                <span style="font-family:monospace;font-size:11px;padding:2px 8px;border-radius:6px;color:${badgeColor};">${st.stageStatus}</span>
+              </div>
+              <div style="font-size:12px;color:#cbd5e1;line-height:1.5;">
+                <div><span style="color:#64748b;">Actor:</span> ${st.actor}</div>
+                <div><span style="color:#64748b;">Place:</span> ${st.location}</div>
+                <div><span style="color:#64748b;">Temperature:</span> <strong style="color:${st.tempStatus === 'SAFE' ? '#34d399' : '#fb7185'}">${tempStr}</strong></div>
+                <div style="margin-top:4px;color:${alert ? '#fda4af' : '#94a3b8'};">${st.incidentSummary}</div>
+              </div>
+            </div>`;
+          })
+          .join('')
+      : `<div style="padding:12px;border-radius:10px;background:#020617;border:1px solid #1e293b;font-size:13px;color:#cbd5e1;">
+          <div><strong>Holder:</strong> ${String(req.query.holder || 'Verified Supply Node')}</div>
+          <div><strong>Location:</strong> ${String(req.query.place || 'Supply Chain Checkpoint')}</div>
+          <div><strong>Cold Chain:</strong> ${String(req.query.temp || '2.0°C - 8.0°C')}</div>
+        </div>`;
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MedSupply Sentinel | QR Certificate ${rawSerial}</title>
+</head>
+<body style="margin:0;background:#020617;color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:16px;">
+  <div style="max-width:480px;margin:0 auto;background:#0f172a;border:1px solid #1e293b;border-radius:16px;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,0.5);">
+    <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1e293b;padding-bottom:12px;margin-bottom:16px;">
+      <div>
+        <div style="font-size:11px;color:#34d399;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;">MedSupply Sentinel</div>
+        <div style="font-size:16px;font-weight:700;color:#f8fafc;">Mobile QR Verification Certificate</div>
+      </div>
+      <span style="font-family:monospace;font-size:11px;padding:4px 8px;border-radius:6px;background:#020617;border:1px solid #334155;color:#38bdf8;">ISO-18004</span>
+    </div>
+
+    <div style="padding:14px;border-radius:12px;margin-bottom:16px;background:${isSafe ? '#022c22' : '#4c0519'};border:1px solid ${isSafe ? '#059669' : '#e11d48'};">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:${isSafe ? '#6ee7b7' : '#fda4af'};margin-bottom:4px;">
+        ${isSafe ? 'VERIFIED AUTHENTIC & SAFE' : 'SAFETY / COUNTERFEIT ALERT'}
+      </div>
+      <div style="font-size:16px;font-weight:700;color:#ffffff;margin-bottom:6px;">${headline}</div>
+      <div style="font-size:12px;color:#e2e8f0;line-height:1.5;">${subheadline}</div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;font-size:12px;">
+      <div style="background:#020617;border:1px solid #1e293b;padding:10px;border-radius:8px;">
+        <div style="color:#64748b;font-size:11px;">Medicine</div>
+        <div style="font-weight:700;color:#f8fafc;margin-top:2px;">${brand}</div>
+        <div style="font-family:monospace;color:#94a3b8;font-size:11px;">${batchCode}</div>
+      </div>
+      <div style="background:#020617;border:1px solid #1e293b;padding:10px;border-radius:8px;">
+        <div style="color:#64748b;font-size:11px;">Pack Serial</div>
+        <div style="font-family:monospace;font-weight:700;color:#34d399;margin-top:2px;">${rawSerial || 'N/A'}</div>
+        <div style="color:#94a3b8;font-size:11px;">Status: ${pack?.status || 'Checked'}</div>
+      </div>
+    </div>
+
+    <div style="font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">
+      Stage-by-Stage Supply Chain &amp; Cold-Chain Audit
+    </div>
+    ${stagesHtml}
+
+    <a href="/?verify=${encodeURIComponent(rawSerial)}" style="display:block;text-align:center;margin-top:16px;padding:12px;border-radius:10px;background:#10b981;color:#020617;font-weight:700;font-size:13px;text-decoration:none;">
+      Open Full Interactive Dashboard →
+    </a>
+  </div>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
+  };
+
+  app.get('/qr-verify', renderMobileQrCertificate);
+  app.get('/01/:gtin/21/:serial', renderMobileQrCertificate);
 
   const isProduction = process.env.NODE_ENV === 'production' || process.argv.includes('--prod');
 

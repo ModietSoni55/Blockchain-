@@ -12,6 +12,7 @@ import {
   Network,
   FileCheck2,
   Unlock,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   BatchRecord,
@@ -21,7 +22,6 @@ import {
   CommandAuditRecord,
   RoleType,
   ShamirShareRecord,
-  canRoleExecuteAction,
   buildBatchMerkleTree,
   generateMerkleInclusionProof,
   computeEIP712AttestationDigest,
@@ -30,6 +30,7 @@ import {
   createNIZKPrescriptionProof,
   verifyNIZKPrescriptionProof,
   buildHashChainedBlocks,
+  buildTelemetryHashChain,
   deriveDeterministicPUFPrint,
   perturbPUFBits,
   computePUFHammingMatch,
@@ -49,6 +50,8 @@ export interface EvmStatusInfo {
   blockNumber: string;
 }
 
+export type CryptoTab = 'merkle' | 'eip712' | 'zkp' | 'blocks' | 'shamir_puf';
+
 interface BlockchainCryptographyStudioProps {
   batches: BatchRecord[];
   packs: MedicinePackRecord[];
@@ -61,15 +64,17 @@ interface BlockchainCryptographyStudioProps {
   prefillZkWitness?: { serial: string; rxId: string; salt: string } | null;
   onProbeEvmRpc?: () => void;
   activeRole?: RoleType;
-  onAnchorBatchMerkleRoot?: (batchId: string, merkleRoot: string) => void;
+  selectedPackSerial?: string;
+  selectedBatchId?: string;
+  onSelectPackSerial?: (serial: string) => void;
+  externalTabRequest?: { tab: CryptoTab; seq: number } | null;
+  onAnchorBatchMerkleRoot?: (batchId: string, merkleRoot: string) => Promise<void> | void;
   onAuditBreakGlassShamir?: (
     serialNumber: string,
     shareIndices: number[],
     unsealedShares?: ShamirShareRecord[]
   ) => Promise<void>;
 }
-
-type CryptoTab = 'merkle' | 'eip712' | 'zkp' | 'blocks' | 'shamir_puf';
 
 export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudioProps> = ({
   batches,
@@ -82,23 +87,34 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
   issuerPublicAddress = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
   prefillZkWitness = null,
   onProbeEvmRpc,
-  activeRole = 'MANUFACTURER',
+  selectedPackSerial,
+  selectedBatchId: propSelectedBatchId,
+  onSelectPackSerial,
+  externalTabRequest = null,
   onAnchorBatchMerkleRoot,
   onAuditBreakGlassShamir,
 }) => {
   const [activeTab, setActiveTab] = useState<CryptoTab>('merkle');
 
   // Merkle Tree & Inclusion Proof state
-  const [selectedBatchId, setSelectedBatchId] = useState<string>(batches[0]?.batchId || '');
+  const [selectedBatchId, setSelectedBatchId] = useState<string>(
+    propSelectedBatchId || batches[0]?.batchId || ''
+  );
   const [selectedSerialForProof, setSelectedSerialForProof] = useState<string>(
-    packs[0]?.serialNumber || 'SN-PCV20-2026-0001'
+    selectedPackSerial || packs[0]?.serialNumber || 'SN-PCV20-2026-0001'
   );
   const [tamperLeafMode, setTamperLeafMode] = useState<boolean>(false);
   const [anchorSuccessMsg, setAnchorSuccessMsg] = useState<string>('');
   const [anchorErrorMsg, setAnchorErrorMsg] = useState<string>('');
+  const [isAnchoringRoot, setIsAnchoringRoot] = useState<boolean>(false);
+
+  // EIP-712 Signature Tamper Simulation state
+  const [eip712TamperMode, setEip712TamperMode] = useState<boolean>(false);
 
   // Zero-Knowledge Prescription Receipt Commitment state
-  const [zkSerial, setZkSerial] = useState<string>(packs[0]?.serialNumber || 'SN-PCV20-2026-0001');
+  const [zkSerial, setZkSerial] = useState<string>(
+    selectedPackSerial || packs[0]?.serialNumber || 'SN-PCV20-2026-0001'
+  );
   const [zkPrescriptionId, setZkPrescriptionId] = useState<string>('RX-2026-88412');
   const [zkPatientSalt, setZkPatientSalt] = useState<string>('PATIENT-BLINDING-SALT-9941');
   const [zkVerifierSaltInput, setZkVerifierSaltInput] = useState<string>(
@@ -112,6 +128,9 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
     'coldChainCompliant',
   ]);
 
+  // Block & Cold-Chain Tamper Simulation state
+  const [simulateBlockTamper, setSimulateBlockTamper] = useState<boolean>(false);
+
   // Shamir (2,3) Finite-Field Break-Glass + ECIES Custodian Unlock + PUF Twin-Tag state
   const [shamirPackSerial, setShamirPackSerial] = useState<string>(
     packs.find((p) => (p.shamirRecallShares?.length ?? 0) > 0)?.serialNumber ||
@@ -124,6 +143,27 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
   const [nizkTamperMode, setNizkTamperMode] = useState<boolean>(false);
   const [shamirAuditFeedback, setShamirAuditFeedback] = useState<string>('');
   const [pufSimDriftBits, setPufSimDriftBits] = useState<number>(6);
+
+  // Sync external tab navigation requests from the 5-Pillar Executive Scorecard
+  useEffect(() => {
+    if (externalTabRequest) {
+      setActiveTab(externalTabRequest.tab);
+    }
+  }, [externalTabRequest]);
+
+  // Sync selectedPackSerial from parent across all 5 proof tabs
+  useEffect(() => {
+    if (!selectedPackSerial) return;
+    const matchedPack = packs.find((p) => p.serialNumber === selectedPackSerial);
+    if (matchedPack) {
+      setSelectedSerialForProof(matchedPack.serialNumber);
+      setZkSerial(matchedPack.serialNumber);
+      setSelectedBatchId(matchedPack.batchId);
+      if ((matchedPack.shamirRecallShares?.length ?? 0) > 0) {
+        setShamirPackSerial(matchedPack.serialNumber);
+      }
+    }
+  }, [selectedPackSerial, packs]);
 
   useEffect(() => {
     if (prefillZkWitness) {
@@ -172,12 +212,12 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       serialNumber: activePackForEip712.serialNumber,
       serialHash: activePackForEip712.serialHash,
       batchId: activePackForEip712.batchId,
-      expiresAt: activeBatch.expiresAt,
+      expiresAt: eip712TamperMode ? '2099-12-31' : activeBatch.expiresAt,
       nonce: activePackForEip712.nonce,
       status: activePackForEip712.status,
       chainId: 31337,
     });
-  }, [activePackForEip712, activeBatch]);
+  }, [activePackForEip712, activeBatch, eip712TamperMode]);
 
   const zkCommitment = useMemo(
     () => createZKPrescriptionCommitment(zkSerial, zkPrescriptionId, zkPatientSalt),
@@ -227,6 +267,12 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
     () => buildHashChainedBlocks(custodyEvents),
     [custodyEvents]
   );
+
+  const telemetryHashChain = useMemo(() => {
+    const batchIdTarget = activeBatch?.batchId || batches[0]?.batchId || '';
+    const readings = telemetry.filter((t) => t.batchId === batchIdTarget);
+    return buildTelemetryHashChain(readings.length > 0 ? readings : telemetry.slice(0, 6));
+  }, [telemetry, activeBatch, batches]);
 
   // SD-VC Verifiable Credential computation
   const sdPack = useMemo(
@@ -330,26 +376,47 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       activeBatch.anchoredMerkleRoot.toLowerCase() === merkleTreeData.merkleRoot.toLowerCase()
   );
 
-  const handleAnchorRoot = () => {
+  const handleAnchorRoot = async () => {
     if (!activeBatch) return;
     setAnchorErrorMsg('');
     setAnchorSuccessMsg('');
-
-    const rbac = canRoleExecuteAction(activeRole, 'ANCHOR_MERKLE_ROOT');
-    if (!rbac.allowed) {
-      setAnchorErrorMsg(
-        rbac.reason ||
-          `AccessControl: Only MANUFACTURER_ROLE can anchor a batch Merkle root (active: ${activeRole}).`
+    setIsAnchoringRoot(true);
+    try {
+      if (onAnchorBatchMerkleRoot) {
+        await onAnchorBatchMerkleRoot(activeBatch.batchId, merkleTreeData.merkleRoot);
+      }
+      setAnchorSuccessMsg(
+        `Anchored Merkle Root ${merkleTreeData.merkleRoot.slice(0, 18)}... on MedSupplySentinel.sol for ${activeBatch.batchCode} (persisted to SQLite ledger).`
       );
-      return;
+    } catch (err) {
+      setAnchorErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsAnchoringRoot(false);
     }
+  };
 
-    if (onAnchorBatchMerkleRoot) {
-      onAnchorBatchMerkleRoot(activeBatch.batchId, merkleTreeData.merkleRoot);
-    }
-    setAnchorSuccessMsg(
-      `Anchored Merkle Root ${merkleTreeData.merkleRoot.slice(0, 18)}... on MedSupplySentinel.sol for ${activeBatch.batchCode} (persisted to disk ledger).`
-    );
+  const handleUnlockShareIndicesPreset = (indices: number[]) => {
+    if (!shamirPack) return;
+    setUnlockedSharesByKey((prev) => {
+      const next = { ...prev };
+      for (const share of shamirShares) {
+        const keyId = `${shamirPack.serialNumber}:${share.index}`;
+        if (indices.includes(share.index) && share.eciesEnvelope) {
+          const priv = getCustodianPrivateKey(share.index);
+          if (priv) {
+            try {
+              const chunks = decryptShamirShareECIES(share.eciesEnvelope, priv);
+              next[keyId] = { ...share, yChunksHex: chunks, isSealedECIES: false };
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+      return next;
+    });
+    setSelectedShareIndices(indices);
+    setShamirAuditFeedback('');
   };
 
   return (
@@ -435,9 +502,14 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       {/* TAB 1: BATCH MERKLE TREE & O(log N) INCLUSION PROOFS */}
       {activeTab === 'merkle' && activeBatch && (
         <div className="space-y-4">
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300">
-            <strong className="text-emerald-300">What this proves: </strong>
-            Instead of storing millions of individual pack IDs on-chain, the manufacturer anchors one compact Batch Merkle Root. Any pack can prove it belongs to that batch in a few quick hash steps—even offline.
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 space-y-1">
+            <div>
+              <strong className="text-emerald-300">How Batch Verification (Merkle Tree) Works in Simple Terms: </strong>
+              Instead of paying high blockchain gas fees to store thousands of individual medicine boxes on-chain, the manufacturer hashes every box in the batch into a single <strong>Batch Master Fingerprint (Merkle Root)</strong>.
+            </div>
+            <div className="text-slate-400">
+              1. Pick any batch &amp; medicine pack below → 2. Click <strong>Anchor Batch Merkle Root On-Chain</strong> to lock the batch fingerprint → 3. Click <strong>Simulate Unregistered Leaf</strong> to see how a fake serial number is immediately rejected.
+            </div>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-5 space-y-4">
@@ -460,7 +532,10 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                     const nextBatchId = e.target.value;
                     setSelectedBatchId(nextBatchId);
                     const firstInBatch = packs.find((p) => p.batchId === nextBatchId);
-                    if (firstInBatch) setSelectedSerialForProof(firstInBatch.serialNumber);
+                    if (firstInBatch) {
+                      setSelectedSerialForProof(firstInBatch.serialNumber);
+                      onSelectPackSerial?.(firstInBatch.serialNumber);
+                    }
                     setAnchorSuccessMsg('');
                   }}
                   className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 font-mono"
@@ -485,6 +560,7 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                   value={selectedSerialForProof}
                   onChange={(e) => {
                     setSelectedSerialForProof(e.target.value);
+                    onSelectPackSerial?.(e.target.value);
                     setTamperLeafMode(false);
                   }}
                   className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 font-mono"
@@ -500,10 +576,15 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
               <div className="flex flex-wrap gap-2 pt-1">
                 <button
                   type="button"
+                  disabled={isAnchoringRoot}
                   onClick={handleAnchorRoot}
-                  className="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold text-xs rounded-lg transition-colors"
+                  className="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-slate-950 font-semibold text-xs rounded-lg transition-colors"
                 >
-                  Anchor Batch Merkle Root On-Chain
+                  {isAnchoringRoot
+                    ? 'Anchoring On-Chain...'
+                    : isCurrentBatchAnchored
+                    ? 'Re-Anchor Batch Merkle Root On-Chain'
+                    : 'Anchor Batch Merkle Root On-Chain'}
                 </button>
                 <button
                   type="button"
@@ -667,18 +748,35 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       {/* TAB 2: EIP-712 TYPED STRUCTURED DATA & ERC-5192 SOULBOUND LOCK */}
       {activeTab === 'eip712' && eip712Attestation && activePackForEip712 && (
         <div className="space-y-4">
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300">
-            <strong className="text-emerald-300">What this proves: </strong>
-            Every medicine pack carries a tamper-proof EIP-712 digital signature and an ERC-5192 Soulbound Lock so once dispensed to a patient, the pack token can never be resold or transferred again.
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 space-y-1">
+            <div>
+              <strong className="text-emerald-300">How Digital Seal &amp; Anti-Resale Lock (EIP-712 &amp; ERC-5192) Work: </strong>
+              Every medicine pack has a structured digital passport signed by the manufacturer&apos;s private key (EIP-712). When a pharmacy sells the pack to a patient, the smart contract flips <code>locked(tokenId) = true</code> (ERC-5192 Soulbound Lock) so the QR code can never be resold.
+            </div>
+            <div className="text-slate-400">
+              Click <strong>Simulate Altered Expiry / Forged Seal</strong> below to see how changing even one field invalidates the manufacturer&apos;s cryptographic signature.
+            </div>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-6 space-y-4">
             <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-200">
-                  EIP-712 Domain & Struct TypeHash Inspector
+                  EIP-712 Domain &amp; Struct TypeHash Inspector
                 </span>
-                <span className="text-xs font-mono text-emerald-400">EIP-712 v4</span>
+                <button
+                  type="button"
+                  onClick={() => setEip712TamperMode((v) => !v)}
+                  className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border transition-colors ${
+                    eip712TamperMode
+                      ? 'bg-rose-950/70 border-rose-600 text-rose-300'
+                      : 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  {eip712TamperMode
+                    ? 'Restore Authentic Manufacturer Seal'
+                    : 'Simulate Altered Expiry / Forged Seal'}
+                </button>
               </div>
 
               <div>
@@ -691,7 +789,11 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                 <select
                   id="eip712-pack-select"
                   value={activePackForEip712.serialNumber}
-                  onChange={(e) => setSelectedSerialForProof(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedSerialForProof(e.target.value);
+                    onSelectPackSerial?.(e.target.value);
+                    setEip712TamperMode(false);
+                  }}
                   className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 font-mono"
                 >
                   {packs.map((p) => (
@@ -732,9 +834,39 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                 <span className="text-slate-400 block">
                   Final EIP-712 Signing Digest (keccak256(&quot;\x19\x01&quot; || domain || struct)):
                 </span>
-                <span className="text-emerald-400 break-all">
+                <span
+                  className={`break-all ${
+                    eip712TamperMode ? 'text-rose-400' : 'text-emerald-400'
+                  }`}
+                >
                   {eip712Attestation.eip712Digest}
                 </span>
+              </div>
+
+              <div
+                className={`p-3 rounded-lg border font-sans text-xs flex items-start gap-2.5 ${
+                  eip712TamperMode
+                    ? 'bg-rose-950/30 border-rose-700/60 text-rose-300'
+                    : 'bg-emerald-950/30 border-emerald-700/60 text-emerald-300'
+                }`}
+              >
+                {eip712TamperMode ? (
+                  <XCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-400" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+                )}
+                <div>
+                  <div className="font-bold">
+                    {eip712TamperMode
+                      ? 'SIGNATURE MISMATCH — Altered Expiry Date Detected!'
+                      : 'AUTHENTIC MANUFACTURER SIGNATURE — ecrecover() Verified'}
+                  </div>
+                  <div className="text-[11px] opacity-90 mt-0.5">
+                    {eip712TamperMode
+                      ? 'Because the expiry date was modified to 2099-12-31, the recomputed StructHash no longer matches the manufacturer ECDSA signature on the box.'
+                      : `Signed by authorized Manufacturer Key (${issuerPublicAddress.slice(0, 10)}...) and bound to Chain ID 31337.`}
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -776,15 +908,43 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       {/* TAB 3: ZERO-KNOWLEDGE (ZK) PRESCRIPTION & W3C SELECTIVE-DISCLOSURE VERIFIABLE CREDENTIAL */}
       {activeTab === 'zkp' && (
         <div className="space-y-6">
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300">
-            <strong className="text-emerald-300">What this proves: </strong>
-            Patients can prove a pharmacy legitimately dispensed their medicine—and share only selected safety facts at customs or clinics—without revealing their name or prescription ID on the blockchain.
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 space-y-1">
+            <div>
+              <strong className="text-emerald-300">How Patient Privacy (Zero-Knowledge &amp; SD-VC) Works: </strong>
+              Public blockchains are visible to everyone, so we never store a patient&apos;s name or prescription number on-chain. Instead, the pharmacy stores a <strong>blinded mathematical commitment</strong>.
+            </div>
+            <div className="text-slate-400">
+              Use the 1-click buttons below to test a valid patient secret key vs. an impostor guessing the wrong key, or check/uncheck fields in the W3C Verifiable Credential to hide sensitive facts at customs.
+            </div>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             <div className="lg:col-span-6 space-y-4">
               <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-3">
-                <div className="text-xs font-semibold text-slate-200">
-                  Private Prescription Receipt Check (Zero-Knowledge)
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-slate-200">
+                    Private Prescription Receipt Check (Zero-Knowledge)
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setZkVerifierSaltInput(zkPatientSalt);
+                        setNizkTamperMode(false);
+                      }}
+                      className="px-2.5 py-1 rounded bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-700/60 text-emerald-300 text-[11px] font-semibold"
+                    >
+                      Test Valid Patient Key
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setZkVerifierSaltInput('WRONG-IMPOSTOR-SALT-0000');
+                      }}
+                      className="px-2.5 py-1 rounded bg-rose-950/70 hover:bg-rose-900/70 border border-rose-700/60 text-rose-300 text-[11px] font-semibold"
+                    >
+                      Test Wrong Secret Key
+                    </button>
+                  </div>
                 </div>
                 <p className="text-xs text-slate-400">
                   Pharmacies commit{' '}
@@ -804,7 +964,10 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                       id="zk-serial-input"
                       type="text"
                       value={zkSerial}
-                      onChange={(e) => setZkSerial(e.target.value)}
+                      onChange={(e) => {
+                        setZkSerial(e.target.value);
+                        onSelectPackSerial?.(e.target.value);
+                      }}
                       className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded text-slate-100 font-mono"
                     />
                   </div>
@@ -853,7 +1016,7 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
 
                 <div className="pt-3 border-t border-slate-800">
                   <label htmlFor="zk-verify-salt" className="block text-slate-400 mb-1 font-sans">
-                    Verify Zero-Knowledge Witness Salt (Try modifying to test rejection):
+                    Verify Zero-Knowledge Witness Salt (Try modifying or clicking Test Wrong Secret Key):
                   </label>
                   <input
                     id="zk-verify-salt"
@@ -1036,12 +1199,17 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
         </div>
       )}
 
-      {/* TAB 4: HASH-CHAINED EVM BLOCK HEADER, LIVE RPC ADAPTER & EIP-712 AUDIT LOG */}
+      {/* TAB 4: HASH-CHAINED EVM BLOCK HEADER, COLD-CHAIN HASH CHAIN & EIP-712 AUDIT LOG */}
       {activeTab === 'blocks' && (
         <div className="space-y-6">
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 font-sans">
-            <strong className="text-emerald-300">What this proves: </strong>
-            Every custody change and recall decision is cryptographically linked to the previous block and verified against signer permissions so past records cannot be silently rewritten. (Ledger v{ledgerVersion} · Issuer Key {issuerPublicAddress.slice(0, 10)}...)
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 font-sans space-y-1">
+            <div>
+              <strong className="text-emerald-300">How Tamper-Evident Block Chains Work: </strong>
+              Every custody handoff and every cold-chain temperature reading includes the exact cryptographic hash of the block that came before it (<code>parentBlockHash</code>). If anyone tries to rewrite a past temperature reading or custody transfer, every block after it breaks immediately.
+            </div>
+            <div className="text-slate-400">
+              Click <strong>Simulate Historical Block Tampering</strong> on the right to see what happens when someone tries to secretly edit Block #1.
+            </div>
           </div>
           <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-mono">
             <div className="space-y-1">
@@ -1055,43 +1223,150 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
               </div>
               <div className="text-slate-400">
                 RPC Endpoint: {evmStatus?.rpcUrl || 'http://127.0.0.1:8545'} · Authenticated Commands:{' '}
-                {auditLog.length}
+                {auditLog.length} · Custody Blocks: {hashChainedBlocks.length} · Cold-Chain Blocks: {telemetryHashChain.blocks.length}
               </div>
             </div>
-            {onProbeEvmRpc && (
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={onProbeEvmRpc}
-                className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-emerald-300 rounded-lg whitespace-nowrap shrink-0"
+                onClick={() => setSimulateBlockTamper((v) => !v)}
+                className={`px-3 py-2 rounded-lg border font-sans font-semibold text-xs transition-colors ${
+                  simulateBlockTamper
+                    ? 'bg-rose-950/70 border-rose-600 text-rose-300'
+                    : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-amber-300'
+                }`}
               >
-                Probe Anvil / EVM RPC
+                {simulateBlockTamper
+                  ? 'Restore Intact Hash Chain'
+                  : 'Simulate Historical Block Tampering'}
               </button>
-            )}
+              {onProbeEvmRpc && (
+                <button
+                  type="button"
+                  onClick={onProbeEvmRpc}
+                  className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-emerald-300 rounded-lg whitespace-nowrap"
+                >
+                  Probe Anvil / EVM RPC
+                </button>
+              )}
+            </div>
           </div>
+
+          {simulateBlockTamper && (
+            <div className="p-3.5 bg-rose-950/35 border border-rose-700/70 rounded-lg flex items-start gap-2.5 text-xs text-rose-200">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-rose-300">
+                  HISTORICAL TAMPER DETECTED — Hash Chain Link Broken at Block #1 → Block #2!
+                </div>
+                <div className="text-rose-200/90 mt-0.5">
+                  An attacker attempted to alter the payload in Block #1, changing its hash to{' '}
+                  <code className="font-mono">0xdeadbeef...9901</code>. Because Block #2 still points to the original parent hash, the ledger immediately rejects the forged history.
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Visual Hash-Chained Block Sequence Strip */}
           {hashChainedBlocks.length > 0 && (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 font-mono text-xs">
-              {hashChainedBlocks.slice(0, 4).map((blk) => (
-                <div
-                  key={blk.blockNumber}
-                  className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg space-y-1.5"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-emerald-400 font-bold">Block #{blk.blockNumber}</span>
-                    <span className="text-[11px] text-slate-400 tabular-nums">
-                      {blk.gasUsed.toLocaleString()} gas
-                    </span>
+              {hashChainedBlocks.slice(0, 4).map((blk, idx) => {
+                const isTamperedBlock = simulateBlockTamper && idx === 0;
+                const isBrokenLinkBlock = simulateBlockTamper && idx > 0;
+                return (
+                  <div
+                    key={blk.blockNumber}
+                    className={`p-3.5 rounded-lg space-y-1.5 border ${
+                      isTamperedBlock || isBrokenLinkBlock
+                        ? 'bg-rose-950/25 border-rose-700/70'
+                        : 'bg-slate-950 border-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span
+                        className={`font-bold ${
+                          isTamperedBlock || isBrokenLinkBlock
+                            ? 'text-rose-400'
+                            : 'text-emerald-400'
+                        }`}
+                      >
+                        Block #{blk.blockNumber}
+                      </span>
+                      <span className="text-[11px] text-slate-400 tabular-nums">
+                        {isTamperedBlock
+                          ? 'TAMPERED'
+                          : isBrokenLinkBlock
+                          ? 'BROKEN PREV LINK'
+                          : `${blk.gasUsed.toLocaleString()} gas`}
+                      </span>
+                    </div>
+                    <div className="text-slate-200 truncate text-[11px]">{blk.primaryAction}</div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      Hash: {isTamperedBlock ? '0xdeadbeef009901...' : `${blk.blockHash.slice(0, 14)}...`}
+                    </div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        isBrokenLinkBlock ? 'text-rose-400 font-semibold' : 'text-sky-400/90'
+                      }`}
+                    >
+                      ← Prev: {blk.parentBlockHash.slice(0, 14)}...
+                    </div>
                   </div>
-                  <div className="text-slate-200 truncate text-[11px]">{blk.primaryAction}</div>
-                  <div className="text-[10px] text-slate-500 truncate">
-                    Hash: {blk.blockHash.slice(0, 14)}...
-                  </div>
-                  <div className="text-[10px] text-sky-400/90 truncate">
-                    ← Prev: {blk.parentBlockHash.slice(0, 14)}...
-                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Cold-Chain Telemetry Blockchain Sub-Strip */}
+          {telemetryHashChain.blocks.length > 0 && (
+            <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-bold text-slate-100">
+                    Cold-Chain Temperature Hash Chain ({activeBatch?.batchCode || 'Active Batch'})
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    Each IoT sensor reading is chained to the previous temperature block so excursions cannot be deleted.
+                  </p>
                 </div>
-              ))}
+                <span className="text-[11px] font-mono text-emerald-400">
+                  {telemetryHashChain.blocks.length} Anchored Telemetry Blocks
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 text-xs font-mono">
+                {telemetryHashChain.blocks.slice(0, 3).map((tBlk) => (
+                  <div
+                    key={tBlk.event.id}
+                    className={`p-3 rounded-lg border space-y-1 ${
+                      tBlk.event.isBreached
+                        ? 'bg-rose-950/20 border-rose-700/60'
+                        : 'bg-slate-900 border-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-200 font-bold">
+                        Temp Block #{tBlk.blockIndex} · {tBlk.event.temperature.toFixed(1)}°C
+                      </span>
+                      <span
+                        className={`text-[10px] font-semibold ${
+                          tBlk.event.isBreached ? 'text-rose-400' : 'text-emerald-400'
+                        }`}
+                      >
+                        {tBlk.event.isBreached ? 'BREACH RECORDED' : 'SAFE RANGE'}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 font-sans truncate">
+                      {tBlk.event.locationLabel}
+                    </div>
+                    <div className="text-[10px] text-emerald-300/90 truncate">
+                      BlockHash: {tBlk.computedBlockHash.slice(0, 16)}...
+                    </div>
+                    <div className="text-[10px] text-sky-400/90 truncate">
+                      ← PrevHash: {tBlk.prevBlockHash.slice(0, 16)}...
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
@@ -1102,7 +1377,7 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                   <th className="py-2.5 px-3">Block #</th>
                   <th className="py-2.5 px-3">Block Hash / Parent Hash</th>
                   <th className="py-2.5 px-3">State Root</th>
-                  <th className="py-2.5 px-3">Contract Call & Custody Transition</th>
+                  <th className="py-2.5 px-3">Contract Call &amp; Custody Transition</th>
                   <th className="py-2.5 px-3 text-right">Gas Used</th>
                 </tr>
               </thead>
@@ -1167,9 +1442,14 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
       {/* TAB 5: SHAMIR (2,3) FINITE-FIELD BREAK-GLASS, PUF OPTICAL TWIN-TAG & CUSTODY DIVERSION GRAPH */}
       {activeTab === 'shamir_puf' && (
         <div className="space-y-6">
-          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300">
-            <strong className="text-emerald-300">What this proves: </strong>
-            (1) Patient contact info stays split across 3 encrypted keys so 2 authorities must agree during an emergency recall, (2) 256-bit optical foil matching detects photocopied QR stickers, and (3) route graph checks catch grey-market diversion.
+          <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 space-y-1">
+            <div>
+              <strong className="text-emerald-300">How Emergency Recall Vault, Optical Seal &amp; Route Forensics Work: </strong>
+              (1) <strong>2-of-3 Shamir Recall Vault</strong> splits emergency patient contact info across 3 independent custodians so no single party can spy on patients, but any 2 can unlock it during a life-saving recall.
+            </div>
+            <div className="text-slate-400">
+              (2) <strong>Optical PUF Seal</strong> compares the physical 256-bit micro-fiber pattern on the box cap against the blockchain hash to catch photocopied QR stickers, and (3) <strong>Route Forensics</strong> checks for grey-market diversion.
+            </div>
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             {/* Left 6 Cols: 2-of-3 Shamir Threshold Secret Sharing over GF(2^127-1) */}
@@ -1197,6 +1477,7 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                   value={shamirPack?.serialNumber || ''}
                   onChange={(e) => {
                     setShamirPackSerial(e.target.value);
+                    onSelectPackSerial?.(e.target.value);
                     setShamirAuditFeedback('');
                   }}
                   className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg font-mono text-slate-100"
@@ -1209,6 +1490,43 @@ export const BlockchainCryptographyStudio: React.FC<BlockchainCryptographyStudio
                       </option>
                     ))}
                 </select>
+              </div>
+
+              {/* 1-Click Shamir Threshold Quick Demo Buttons */}
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleUnlockShareIndicesPreset([1])}
+                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold transition-colors ${
+                    selectedShareIndices.length === 1
+                      ? 'bg-amber-950/70 border-amber-600 text-amber-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  Test 1 Key Only (Blocked)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleUnlockShareIndicesPreset([1, 3])}
+                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold transition-colors ${
+                    selectedShareIndices.length === 2
+                      ? 'bg-emerald-950/70 border-emerald-600 text-emerald-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  Combine 2-of-3 Keys (Unlock Recall Token)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleUnlockShareIndicesPreset([1, 2, 3])}
+                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold transition-colors ${
+                    selectedShareIndices.length === 3
+                      ? 'bg-sky-950/70 border-sky-600 text-sky-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  Unlock All 3 Keys (3/3 Consensus)
+                </button>
               </div>
 
               <div className="space-y-2">

@@ -155,6 +155,18 @@ export class SqliteLedgerStore {
         timestamp TEXT NOT NULL,
         data TEXT NOT NULL
       );
+
+      CREATE TRIGGER IF NOT EXISTS trg_telemetry_no_update
+      BEFORE UPDATE ON telemetry
+      BEGIN
+        SELECT RAISE(ABORT, 'ImmutableColdChainLedger: Sealed temperature records cannot be modified.');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_telemetry_no_delete
+      BEFORE DELETE ON telemetry
+      BEGIN
+        SELECT RAISE(ABORT, 'ImmutableColdChainLedger: Sealed temperature records cannot be deleted.');
+      END;
     `);
   }
 
@@ -186,6 +198,23 @@ export class SqliteLedgerStore {
         const parsed = JSON.parse(dispensedRow.data) as MedicinePackRecord;
         const firstShare = parsed.shamirRecallShares?.[0];
         if (!firstShare?.isSealedECIES || (firstShare.yChunksHex?.length ?? 0) > 0) {
+          this.resetToSeedState();
+          return;
+        }
+      } catch {
+        this.resetToSeedState();
+        return;
+      }
+    }
+
+    // Ensure telemetry records carry Keccak-256 chain block hashes
+    const firstTel = this.db
+      .prepare("SELECT data FROM telemetry WHERE id = 'tel-1'")
+      .get() as { data: string } | undefined;
+    if (firstTel) {
+      try {
+        const parsedTel = JSON.parse(firstTel.data) as TelemetryEvent;
+        if (!parsedTel.blockHash || !parsedTel.prevBlockHash) {
           this.resetToSeedState();
         }
       } catch {
@@ -236,6 +265,8 @@ export class SqliteLedgerStore {
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      this.db.exec('DROP TRIGGER IF EXISTS trg_telemetry_no_update;');
+      this.db.exec('DROP TRIGGER IF EXISTS trg_telemetry_no_delete;');
       const tables = [
         'batches',
         'packs',
@@ -334,6 +365,20 @@ export class SqliteLedgerStore {
       this.db
         .prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('lastUpdatedAt', ?)")
         .run(now);
+
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_telemetry_no_update
+        BEFORE UPDATE ON telemetry
+        BEGIN
+          SELECT RAISE(ABORT, 'ImmutableColdChainLedger: Sealed temperature records cannot be modified.');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_telemetry_no_delete
+        BEFORE DELETE ON telemetry
+        BEGIN
+          SELECT RAISE(ABORT, 'ImmutableColdChainLedger: Sealed temperature records cannot be deleted.');
+        END;
+      `);
 
       this.db.exec('COMMIT');
       return {
@@ -456,7 +501,7 @@ export class SqliteLedgerStore {
         prevState.custodyEvents,
         nextState.custodyEvents,
         (c) => c.id,
-        'INSERT INTO custody_events (id, serial_hash, batch_id, timestamp, data) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+        'INSERT OR IGNORE INTO custody_events (id, serial_hash, batch_id, timestamp, data) VALUES (?, ?, ?, ?, ?)',
         (c) => [c.id, c.serialHash, c.batchId, c.timestamp, JSON.stringify(c)]
       );
 
@@ -464,7 +509,7 @@ export class SqliteLedgerStore {
         prevState.telemetry,
         nextState.telemetry,
         (t) => t.id,
-        'INSERT INTO telemetry (id, batch_id, timestamp, data) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+        'INSERT OR IGNORE INTO telemetry (id, batch_id, timestamp, data) VALUES (?, ?, ?, ?)',
         (t) => [t.id, t.batchId, t.timestamp, JSON.stringify(t)]
       );
 

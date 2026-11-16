@@ -234,7 +234,7 @@ export default function App() {
   );
   const [custodyErrorMsg, setCustodyErrorMsg] = useState<string>('');
   const [custodySuccessMsg, setCustodySuccessMsg] = useState<string>('');
-  const [autoSwitchSupplyRole, setAutoSwitchSupplyRole] = useState<boolean>(false);
+  const [autoSwitchSupplyRole, setAutoSwitchSupplyRole] = useState<boolean>(true);
   const [regulatorErrorMsg, setRegulatorErrorMsg] = useState<string>('');
   const [regulatorSuccessMsg, setRegulatorSuccessMsg] = useState<string>('');
 
@@ -398,18 +398,49 @@ export default function App() {
     });
     listQueuedOfflineScans().then(setQueuedOfflineScans);
 
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const verifyQuery = urlParams.get('verify') || urlParams.get('serial');
+      if (verifyQuery && verifyQuery.trim()) {
+        const cleanQuery = verifyQuery.trim();
+        setLastScannedSerial(cleanQuery);
+        setScanSerialInput(cleanQuery);
+        setTrackedMapPackSerial(cleanQuery);
+        setActiveSection('verify');
+      }
+    } catch {
+      // Ignore URL query parse error
+    }
+
     const es = new EventSource('/api/events/stream');
     es.addEventListener('ledger_updated', () => {
       refreshFullLedger();
     });
     es.addEventListener('excursion_alert', (evt) => {
       try {
-        const parsed = JSON.parse((evt as MessageEvent).data);
-        setLiveSseBanner(
-          `Live Temperature Alert: Overheating detected (${parsed.temperature ?? 'Breach'}°C)`
-        );
+        const parsed = JSON.parse((evt as MessageEvent).data) as {
+          temperature?: number;
+          breachType?: 'OVERHEATING' | 'SUBCOOLING';
+          batchCode?: string;
+          minTemp?: number;
+          maxTemp?: number;
+          blockHash?: string;
+        };
+        const batchLabel = parsed.batchCode || 'batch';
+        const tempStr =
+          typeof parsed.temperature === 'number' ? `${parsed.temperature.toFixed(1)}°C` : 'Breach';
+        const sealNote = parsed.blockHash ? ` · Block ${parsed.blockHash.slice(0, 10)}...` : '';
+        if (parsed.breachType === 'SUBCOOLING') {
+          setLiveSseBanner(
+            `Live Freeze Alert: ${batchLabel} dropped to ${tempStr} (below safe minimum ${parsed.minTemp ?? 2}°C)${sealNote}`
+          );
+        } else {
+          setLiveSseBanner(
+            `Live Overheat Alert: ${batchLabel} rose to ${tempStr} (above safe maximum ${parsed.maxTemp ?? 8}°C)${sealNote}`
+          );
+        }
       } catch {
-        setLiveSseBanner('Live Temperature Alert pushed from sensor monitor.');
+        setLiveSseBanner('Live Temperature Alert pushed from Cold-Chain Blockchain sensor.');
       }
       refreshFullLedger();
     });
@@ -461,17 +492,37 @@ export default function App() {
     return data;
   };
 
-  const handleSelectSignerIndex = (idx: number) => {
+  const [topBarStatusMsg, setTopBarStatusMsg] = useState<string>('');
+  const [modeMenuFeedback, setModeMenuFeedback] = useState<string>('');
+
+  const handleSelectSignerIndex = (idx: number, openPrimaryPortal = false) => {
     setInjectedWalletAddress(null);
     setCustodyErrorMsg('');
     setCustodySuccessMsg('');
     setRegulatorErrorMsg('');
     setSignerIndex(idx);
     setRoleMenuOpen(false);
-    const nextRole = ROLE_SIGNERS[idx].role;
-    if (nextRole === 'MANUFACTURER') setSupplyRoleTab('manufacturer');
-    if (nextRole === 'DISTRIBUTOR') setSupplyRoleTab('distributor');
-    if (nextRole === 'PHARMACY') setSupplyRoleTab('pharmacy');
+    const chosen = ROLE_SIGNERS[idx];
+    const nextRole = chosen.role;
+    if (nextRole === 'MANUFACTURER') {
+      setSupplyRoleTab('manufacturer');
+      if (openPrimaryPortal) setActiveSection('supply-chain');
+    } else if (nextRole === 'DISTRIBUTOR') {
+      setSupplyRoleTab('distributor');
+      if (openPrimaryPortal) setActiveSection('cold-chain');
+    } else if (nextRole === 'PHARMACY') {
+      setSupplyRoleTab('pharmacy');
+      if (openPrimaryPortal) setActiveSection('verify');
+    } else if (nextRole === 'REGULATOR') {
+      if (openPrimaryPortal) setActiveSection('regulator');
+    }
+    setTopBarStatusMsg(
+      `Switched active EIP-712 signer to ${chosen.label} (${chosen.address.slice(0, 8)}...${chosen.address.slice(-4)}) · ${
+        autoSwitchSupplyRole
+          ? 'Guided Auto-Switch is ON'
+          : `Strict RBAC Lock ON (${chosen.role} permissions only)`
+      }`
+    );
   };
 
   const handleSwitchToRole = (targetRole: RoleType, regulatorInspector: 1 | 2 = 1) => {
@@ -484,7 +535,30 @@ export default function App() {
     }
   };
 
+  const handleSelectActivePackAcrossTabs = (serialNumber: string) => {
+    if (!serialNumber) return;
+    setLastScannedSerial(serialNumber);
+    setScanSerialInput(serialNumber);
+    setTrackedMapPackSerial(serialNumber);
+    const matchedPack = packs.find(
+      (p) => p.serialNumber.toLowerCase() === serialNumber.toLowerCase()
+    );
+    if (matchedPack) {
+      setSelectedBatchForIoT(matchedPack.batchId);
+      setSelectedBatchForMint(matchedPack.batchId);
+      setPalletBatchId(matchedPack.batchId);
+    }
+  };
+
   const handleConnectBrowserWallet = async () => {
+    if (injectedWalletAddress) {
+      setInjectedWalletAddress(null);
+      setRoleMenuOpen(false);
+      setTopBarStatusMsg(
+        `Disconnected external Web3 wallet · Restored built-in EIP-712 signer ${activeSigner.label}.`
+      );
+      return;
+    }
     const eth = (
       window as unknown as {
         ethereum?: { request: (args: { method: string }) => Promise<string[]> };
@@ -496,12 +570,19 @@ export default function App() {
         if (accounts && accounts[0]) {
           setInjectedWalletAddress(accounts[0]);
           setRoleMenuOpen(false);
+          setTopBarStatusMsg(`Connected browser Web3 wallet ${accounts[0]}.`);
+          return;
         }
       } catch {
-        // User declined or unavailable
+        // Fallback to simulated external Web3 wallet below
       }
     }
+    const simulatedExternal = '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199';
+    setInjectedWalletAddress(simulatedExternal);
     setRoleMenuOpen(false);
+    setTopBarStatusMsg(
+      `Connected External Web3 Inspector Wallet (${simulatedExternal.slice(0, 8)}...${simulatedExternal.slice(-4)}) in sandbox mode.`
+    );
   };
 
   const handleUseBrowserGPS = () => {
@@ -628,6 +709,12 @@ export default function App() {
 
       const targetSerial = data.pack?.serialNumber || trimmed;
       setLastScannedSerial(targetSerial);
+      setTrackedMapPackSerial(targetSerial);
+      if (data.pack?.batchId) {
+        setSelectedBatchForIoT(data.pack.batchId);
+        setSelectedBatchForMint(data.pack.batchId);
+        setPalletBatchId(data.pack.batchId);
+      }
 
       const isSigTampered = data.outcome === 'TAMPERED_SIGNATURE';
       const isPufCloned = data.outcome === 'PHOTOCOPY_CLONE_DETECTED';
@@ -825,40 +912,58 @@ export default function App() {
     setBatchFormSuccess('');
 
     const rbac = canRoleExecuteAction(activeSigner.role, 'MINT_BATCH');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setBatchFormError(
-        rbac.reason || `Please switch your role to Manufacturer to register new batches.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[0];
+        handleSelectSignerIndex(0);
+      } else {
+        setBatchFormError(
+          rbac.reason || `Please switch your role to Manufacturer to register new batches.`
+        );
+        return;
+      }
     }
 
+    const fallbackSuffix = String(Date.now()).slice(-4);
+    const effectiveBatchCode = newBatchCode.trim() || `BATCH-MRNA-${fallbackSuffix}`;
+    const effectiveBrandName = newBrandName.trim() || 'Comirnaty mRNA Cold-Chain Vial';
+
     try {
-      const res = await executeSignedCommand('mint-batch', newBatchCode.trim(), {
-        batchCode: newBatchCode.trim(),
-        brandName: newBrandName.trim(),
-        genericName: newGenericName.trim(),
-        productCode: newProductCode.trim(),
-        totalPacks: Number(newTotalPacks) || 100,
-        minTemp: Number(newMinTemp),
-        maxTemp: Number(newMaxTemp),
-        originHubId: newOriginHubId,
-        destHubId: newDestHubId,
-        carrierName: dispatchDistributorName,
-      });
+      const res = await executeSignedCommand(
+        'mint-batch',
+        effectiveBatchCode,
+        {
+          batchCode: effectiveBatchCode,
+          brandName: effectiveBrandName,
+          genericName: newGenericName.trim() || `${effectiveBrandName} Formulation`,
+          productCode: newProductCode.trim(),
+          totalPacks: Number(newTotalPacks) || 100,
+          minTemp: Number(newMinTemp),
+          maxTemp: Number(newMaxTemp),
+          originHubId: newOriginHubId,
+          destHubId: newDestHubId,
+          carrierName: dispatchDistributorName,
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       const createdBatch = res.createdBatch as BatchRecord | undefined;
       const firstSerial = String(res.firstSerial || '');
       if (createdBatch) {
         setSelectedBatchForMint(createdBatch.batchId);
         setSelectedBatchForIoT(createdBatch.batchId);
+        setPalletBatchId(createdBatch.batchId);
       }
       if (firstSerial) {
         setTrackedMapPackSerial(firstSerial);
+        setLastScannedSerial(firstSerial);
+        setScanSerialInput(firstSerial);
       }
       setNewBatchCode('');
       setNewBrandName('');
       setNewGenericName('');
       setBatchFormSuccess(
-        `Created batch ${createdBatch?.batchCode || ''} and sealed initial pack ${firstSerial}.`
+        `Created batch ${createdBatch?.batchCode || effectiveBatchCode} and sealed initial pack ${firstSerial}.`
       );
     } catch (err) {
       setBatchFormError(err instanceof Error ? err.message : String(err));
@@ -869,20 +974,34 @@ export default function App() {
     setBatchFormError('');
     setBatchFormSuccess('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'MINT_BATCH');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setBatchFormError(
-        rbac.reason || `Please switch your role to Manufacturer to issue pack labels.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[0];
+        handleSelectSignerIndex(0);
+      } else {
+        setBatchFormError(
+          rbac.reason || `Please switch your role to Manufacturer to issue pack labels.`
+        );
+        return;
+      }
     }
     try {
-      const res = await executeSignedCommand('mint-packs', selectedBatchForMint, {
-        batchId: selectedBatchForMint,
-        count: Math.min(Math.max(Number(mintPackCount) || 1, 1), 20),
-        originHubId: newOriginHubId,
-      });
+      const res = await executeSignedCommand(
+        'mint-packs',
+        selectedBatchForMint,
+        {
+          batchId: selectedBatchForMint,
+          count: Math.min(Math.max(Number(mintPackCount) || 1, 1), 20),
+          originHubId: newOriginHubId,
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       if (res.firstSerial) {
-        setTrackedMapPackSerial(String(res.firstSerial));
+        const fs = String(res.firstSerial);
+        setTrackedMapPackSerial(fs);
+        setLastScannedSerial(fs);
+        setScanSerialInput(fs);
       }
       setBatchFormSuccess(
         `Issued ${String(res.count || mintPackCount)} new signed pack(s) for ${String(res.batchCode || '')}.`
@@ -974,36 +1093,49 @@ export default function App() {
     }
   };
 
-  const handleAdvanceFlowStage = async (serialNumber: string, action: FlowStageAdvanceAction) => {
+  const handleAdvanceFlowStage = async (
+    serialNumber: string,
+    action: FlowStageAdvanceAction,
+    options?: {
+      nextCustodian?: string;
+      hubIdOrLocation?: string;
+      handoverTemp?: number;
+      prescriptionRef?: string;
+      simulateUnauthorizedBroker?: boolean;
+    }
+  ) => {
     const stageConfig =
       action === 'SHIP_TO_DISTRIBUTOR'
         ? {
             signerIdx: 0,
             targetStatus: 'IN_TRANSIT' as const,
-            nextCustodian: dispatchDistributorName,
+            nextCustodian: options?.nextCustodian || dispatchDistributorName,
             nextRole: 'DISTRIBUTOR' as const,
             actionName: 'TRANSFER_DISTRIBUTOR',
-            hubIdOrLocation: dispatchDestinationHubId,
-            handoverTemp: undefined,
+            hubIdOrLocation: options?.hubIdOrLocation || dispatchDestinationHubId,
+            handoverTemp: options?.handoverTemp,
           }
         : action === 'DELIVER_TO_PHARMACY'
         ? {
             signerIdx: 1,
             targetStatus: 'AT_PHARMACY' as const,
-            nextCustodian: deliveryPharmacyName,
+            nextCustodian: options?.nextCustodian || deliveryPharmacyName,
             nextRole: 'PHARMACY' as const,
             actionName: 'TRANSFER_PHARMACY',
-            hubIdOrLocation: deliveryHubId,
-            handoverTemp: parseFloat(deliveryHandoverTemp) || 4.4,
+            hubIdOrLocation: options?.hubIdOrLocation || deliveryHubId,
+            handoverTemp:
+              options?.handoverTemp !== undefined
+                ? options.handoverTemp
+                : parseFloat(deliveryHandoverTemp) || 4.4,
           }
         : {
             signerIdx: 2,
             targetStatus: 'DISPENSED' as const,
-            nextCustodian: `Patient (${dispensePatientRef || 'RX-2026-88412'})`,
+            nextCustodian: `Patient (${options?.prescriptionRef || dispensePatientRef || 'RX-2026-88412'})`,
             nextRole: 'PATIENT' as const,
             actionName: 'DISPENSED_TO_PATIENT',
-            hubIdOrLocation: dispenseClinicDesk,
-            handoverTemp: undefined,
+            hubIdOrLocation: options?.hubIdOrLocation || dispenseClinicDesk,
+            handoverTemp: options?.handoverTemp,
           };
 
     const roleSigner = ROLE_SIGNERS[stageConfig.signerIdx];
@@ -1019,8 +1151,9 @@ export default function App() {
         nextRole: stageConfig.nextRole,
         actionName: stageConfig.actionName,
         hubIdOrLocation: stageConfig.hubIdOrLocation,
-        prescriptionRef: dispensePatientRef || 'RX-2026-88412',
+        prescriptionRef: options?.prescriptionRef || dispensePatientRef || 'RX-2026-88412',
         handoverTemp: stageConfig.handoverTemp,
+        simulateUnauthorizedBroker: Boolean(options?.simulateUnauthorizedBroker),
       },
       signer: roleSigner,
       injectedWalletAddress: null,
@@ -1063,15 +1196,26 @@ export default function App() {
     setCustodyErrorMsg('');
     setPalletMsg('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'COMMISSION_PALLET');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setCustodyErrorMsg(rbac.reason || 'Switch to Manufacturer role to bundle pallets.');
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[0];
+        handleSelectSignerIndex(0);
+      } else {
+        setCustodyErrorMsg(rbac.reason || 'Switch to Manufacturer role to bundle pallets.');
+        return;
+      }
     }
     try {
-      const res = await executeSignedCommand('commission-pallet', palletBatchId, {
-        batchId: palletBatchId,
-        childSerials: selectedPalletSerials,
-      });
+      const res = await executeSignedCommand(
+        'commission-pallet',
+        palletBatchId,
+        {
+          batchId: palletBatchId,
+          childSerials: selectedPalletSerials,
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       const pal = res.pallet as PalletContainerRecord | undefined;
       setPalletMsg(
         `Created shipping pallet ${pal?.sscc || ''} with ${pal?.childSerials.length || 0} pack(s).`
@@ -1090,17 +1234,29 @@ export default function App() {
     setCustodyErrorMsg('');
     setPalletMsg('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'TRANSFER_PALLET');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setCustodyErrorMsg(rbac.reason || 'Active account lacks permission for this pallet transfer.');
-      return;
+      if (autoSwitchSupplyRole) {
+        const targetIdx = nextRole === 'DISTRIBUTOR' ? 0 : 1;
+        signerOverride = ROLE_SIGNERS[targetIdx];
+        handleSelectSignerIndex(targetIdx);
+      } else {
+        setCustodyErrorMsg(rbac.reason || 'Active account lacks permission for this pallet transfer.');
+        return;
+      }
     }
     try {
-      await executeSignedCommand('transfer-pallet', pallet.sscc, {
-        sscc: pallet.sscc,
-        nextCustodian,
-        nextRole,
-        hubId,
-      });
+      await executeSignedCommand(
+        'transfer-pallet',
+        pallet.sscc,
+        {
+          sscc: pallet.sscc,
+          nextCustodian,
+          nextRole,
+          hubId,
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       setPalletMsg(
         `Transferred pallet ${pallet.sscc} (${pallet.childSerials.length} packs) to ${nextCustodian}.`
       );
@@ -1158,15 +1314,193 @@ export default function App() {
         location: simLocation.trim(),
         deviceId: 'IOT-DHT22-901',
       });
-      const evalResult = res.evaluation as { isBreached: boolean } | undefined;
-      setIotFeedback(
-        evalResult?.isBreached
-          ? `Overheat Alert: ${tempVal.toFixed(1)}°C is outside the safe range (${batch.minTemp}°C – ${batch.maxTemp}°C) for ${batch.batchCode}.`
-          : `Safe reading (${tempVal.toFixed(1)}°C) recorded for ${batch.batchCode}.`
-      );
+      const evalResult = res.evaluation as
+        | { isBreached: boolean; breachType?: 'OVERHEATING' | 'SUBCOOLING' }
+        | undefined;
+      const reading = res.reading as TelemetryEvent | undefined;
+      const blkNote = reading?.blockIndex ? ` (Sealed on Block #${reading.blockIndex})` : '';
+      if (evalResult?.isBreached) {
+        setIotFeedback(
+          evalResult.breachType === 'SUBCOOLING'
+            ? `Freeze / Subcooling Alert: ${tempVal.toFixed(1)}°C dropped below safe minimum ${batch.minTemp}°C for ${batch.batchCode}${blkNote}.`
+            : `Overheat Alert: ${tempVal.toFixed(1)}°C exceeded safe maximum ${batch.maxTemp}°C for ${batch.batchCode}${blkNote}.`
+        );
+      } else {
+        setIotFeedback(
+          `Safe reading (${tempVal.toFixed(1)}°C) recorded for ${batch.batchCode}${blkNote}.`
+        );
+      }
     } catch (err) {
       setIotFeedback(err instanceof Error ? err.message : String(err));
     }
+  };
+
+  const handleCreateBatchAndSelect = async (params: {
+    batchCode: string;
+    brandName: string;
+    genericName?: string;
+    minTemp: number;
+    maxTemp: number;
+    originHubId?: string;
+    destHubId?: string;
+    initialTemp?: number;
+  }): Promise<{ batchId: string; batchCode: string; firstSerial: string }> => {
+    const rbac = canRoleExecuteAction(activeSigner.role, 'MINT_BATCH');
+    let signerOverride: SandboxSignerProfile | undefined;
+    if (!rbac.allowed) {
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[0];
+        handleSelectSignerIndex(0);
+      } else {
+        throw new Error(
+          rbac.reason ||
+            `Strict RBAC Blocked: Active role (${activeSigner.role}) cannot create batches. Switch to Manufacturer in the top Role menu or enable Guided Auto-Switch in Mode.`
+        );
+      }
+    }
+    const res = await executeSignedCommand(
+      'mint-batch',
+      params.batchCode,
+      {
+        batchCode: params.batchCode,
+        brandName: params.brandName,
+        genericName: params.genericName || `${params.brandName} Formulation`,
+        productCode: newProductCode.trim(),
+        totalPacks: 100,
+        minTemp: params.minTemp,
+        maxTemp: params.maxTemp,
+        originHubId: params.originHubId || newOriginHubId,
+        destHubId: params.destHubId || newDestHubId,
+        carrierName: dispatchDistributorName,
+        initialTemp: params.initialTemp,
+      },
+      signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+    );
+    const createdBatch = res.createdBatch as BatchRecord | undefined;
+    const firstSerial = String(res.firstSerial || '');
+    if (createdBatch) {
+      setSelectedBatchForMint(createdBatch.batchId);
+      setSelectedBatchForIoT(createdBatch.batchId);
+      setPalletBatchId(createdBatch.batchId);
+    }
+    if (firstSerial) {
+      setTrackedMapPackSerial(firstSerial);
+      setLastScannedSerial(firstSerial);
+      setScanSerialInput(firstSerial);
+    }
+    return {
+      batchId: createdBatch?.batchId || '',
+      batchCode: createdBatch?.batchCode || params.batchCode,
+      firstSerial,
+    };
+  };
+
+  const handleRecordBatchTelemetry = async (
+    batchId: string,
+    temperature: number,
+    locationLabel?: string,
+    hubId?: string
+  ): Promise<{ isBreached: boolean; breachType?: 'OVERHEATING' | 'SUBCOOLING' }> => {
+    const rbac = canRoleExecuteAction(activeSigner.role, 'OPERATE_LOGISTICS');
+    let signerOverride: SandboxSignerProfile | undefined;
+    if (!rbac.allowed) {
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[1];
+        handleSelectSignerIndex(1);
+      } else {
+        throw new Error(
+          rbac.reason ||
+            `Strict RBAC Blocked: Active role (${activeSigner.role}) cannot record cold-chain transit telemetry. Switch to Distributor/Pharmacy in the top Role menu or enable Guided Auto-Switch.`
+        );
+      }
+    }
+    setSelectedBatchForIoT(batchId);
+    const res = await executeSignedCommand(
+      'telemetry',
+      batchId,
+      {
+        batchId,
+        temperature,
+        hubId: hubId || selectedHubForIoT,
+        location: locationLabel || 'Distributor Cold-Chain Sensor',
+        deviceId: 'IOT-FLOW-REEFER-01',
+      },
+      signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+    );
+    const evalResult = res.evaluation as
+      | { isBreached: boolean; breachType?: 'OVERHEATING' | 'SUBCOOLING' }
+      | undefined;
+    return evalResult || { isBreached: false };
+  };
+
+  const handleInspectorQuarantineFromFlow = async (
+    batchId: string,
+    quarantineState: boolean,
+    reason: string
+  ) => {
+    const rbac = canRoleExecuteAction(activeSigner.role, 'QUARANTINE_BATCH');
+    let signerOverride: SandboxSignerProfile | undefined;
+    if (!rbac.allowed) {
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        throw new Error(
+          rbac.reason ||
+            `Strict RBAC Blocked: Active role (${activeSigner.role}) cannot quarantine batches. Switch to Safety Regulator in the top Role menu or enable Guided Auto-Switch.`
+        );
+      }
+    }
+    await executeSignedCommand(
+      'quarantine',
+      batchId,
+      {
+        batchId,
+        quarantineState,
+        reason,
+      },
+      signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+    );
+  };
+
+  const handleInspectorRecallFromFlow = async (batchId: string, reason: string) => {
+    const rbac = canRoleExecuteAction(activeSigner.role, 'PROPOSE_RECALL');
+    if (!rbac.allowed && !autoSwitchSupplyRole) {
+      throw new Error(
+        rbac.reason ||
+          `Strict RBAC Blocked: Active role (${activeSigner.role}) cannot execute Class I Recalls. Switch to Safety Regulator in the top Role menu or enable Guided Auto-Switch.`
+      );
+    }
+    const regSigner1 = ROLE_SIGNERS[3];
+    const regSigner2 = ROLE_SIGNERS[4];
+    handleSelectSignerIndex(3);
+    const existingProp = recallProposals.find((rp) => rp.batchId === batchId && !rp.executed);
+    let proposalId = existingProp?.id || '';
+    if (!proposalId) {
+      const propRes = await executeSignedCommand(
+        'recall-propose',
+        batchId,
+        { batchId, reason },
+        { signerOverride: regSigner1, clearInjectedWallet: true }
+      );
+      const createdProp = propRes.proposal as RecallProposalRecord | undefined;
+      proposalId = createdProp?.id || '';
+    }
+    if (proposalId) {
+      handleSelectSignerIndex(4);
+      await executeSignedCommand(
+        'recall-approve',
+        proposalId,
+        { proposalId },
+        { signerOverride: regSigner2, clearInjectedWallet: true }
+      );
+    }
+  };
+
+  const handleTestForgedQRForPack = (serialNumber: string) => {
+    setActiveSection('verify');
+    const tamperedInput = `${serialNumber}:0xdeadbeef0000111122223333444455556666777788889999aaaabbbbccccdddd`;
+    handleVerifySerial(tamperedInput, false);
   };
 
   const activeIoTBatch = useMemo(
@@ -1219,6 +1553,7 @@ export default function App() {
         ok?: boolean;
         error?: string;
         verifiedSensorAddress?: string;
+        reading?: TelemetryEvent;
         state?: Record<string, unknown>;
       };
       if (!res.ok || !data.ok) {
@@ -1226,9 +1561,19 @@ export default function App() {
         return;
       }
       if (data.state) applyServerState(data.state);
-      setIotFeedback(
-        `Signed hardware packet accepted from trusted sensor (${data.verifiedSensorAddress?.slice(0, 10)}...) and locked against replay.`
-      );
+      const reading = data.reading;
+      const blkNote = reading?.blockIndex ? ` · Block #${reading.blockIndex}` : '';
+      if (reading?.isBreached) {
+        setIotFeedback(
+          reading.breachType === 'SUBCOOLING'
+            ? `Signed hardware packet recorded FREEZE ALERT (${reading.temperature.toFixed(1)}°C)${blkNote}.`
+            : `Signed hardware packet recorded OVERHEAT ALERT (${reading.temperature.toFixed(1)}°C)${blkNote}.`
+        );
+      } else {
+        setIotFeedback(
+          `Signed hardware packet accepted from trusted sensor (${data.verifiedSensorAddress?.slice(0, 10)}...) and sealed against tampering${blkNote}.`
+        );
+      }
     } catch (err) {
       setIotFeedback(err instanceof Error ? err.message : String(err));
     }
@@ -1258,26 +1603,39 @@ export default function App() {
     setRegulatorErrorMsg('');
     setRegulatorSuccessMsg('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'QUARANTINE_BATCH');
+    let signerOverride: SandboxSignerProfile | undefined;
+    let usedSigner = activeSigner;
     if (!rbac.allowed) {
-      setRegulatorErrorMsg(
-        rbac.reason || `Please switch to a Safety Regulator account to change batch holds.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        usedSigner = signerOverride;
+        handleSelectSignerIndex(3);
+      } else {
+        setRegulatorErrorMsg(
+          rbac.reason || `Please switch to a Safety Regulator account to change batch holds.`
+        );
+        return;
+      }
     }
 
     const targetBatch = batches.find((b) => b.batchId === batchId);
     if (!targetBatch) return;
 
     try {
-      await executeSignedCommand('quarantine', batchId, {
+      await executeSignedCommand(
+        'quarantine',
         batchId,
-        quarantineState,
-        reason: quarantineReasonInput,
-      });
+        {
+          batchId,
+          quarantineState,
+          reason: quarantineReasonInput,
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       setRegulatorSuccessMsg(
         quarantineState
-          ? `Safety hold placed on ${targetBatch.batchCode} by ${activeSigner.label}.`
-          : `Safety hold released on ${targetBatch.batchCode} by ${activeSigner.label}.`
+          ? `Safety hold placed on ${targetBatch.batchCode} by ${usedSigner.label}.`
+          : `Safety hold released on ${targetBatch.batchCode} by ${usedSigner.label}.`
       );
     } catch (err) {
       setRegulatorErrorMsg(err instanceof Error ? err.message : String(err));
@@ -1288,23 +1646,34 @@ export default function App() {
     setRegulatorErrorMsg('');
     setRegulatorSuccessMsg('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'PROPOSE_RECALL');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setRegulatorErrorMsg(
-        rbac.reason || `Please switch to a Safety Regulator account to propose recalls.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        setRegulatorErrorMsg(
+          rbac.reason || `Please switch to a Safety Regulator account to propose recalls.`
+        );
+        return;
+      }
     }
     const targetBatch = batches.find((b) => b.batchId === batchId);
     if (!targetBatch) return;
     try {
-      await executeSignedCommand('recall-propose', batchId, {
+      await executeSignedCommand(
+        'recall-propose',
         batchId,
-        reason:
-          quarantineReasonInput.trim() ||
-          'Mandatory Class I Recall: Thermal degradation & sterility risk',
-      });
+        {
+          batchId,
+          reason:
+            quarantineReasonInput.trim() ||
+            'Mandatory Class I Recall: Thermal degradation & sterility risk',
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       setRegulatorSuccessMsg(
-        `Recall proposed for ${targetBatch.batchCode} (1 of 2 inspector signatures). Switch to Inspector #2 to co-sign and activate.`
+        `Recall proposed for ${targetBatch.batchCode} (1 of 2 inspector signatures). Click Co-Sign & Execute Recall to finalize.`
       );
     } catch (err) {
       setRegulatorErrorMsg(err instanceof Error ? err.message : String(err));
@@ -1314,15 +1683,34 @@ export default function App() {
   const handleApproveRecallProposal = async (proposalId: string) => {
     setRegulatorErrorMsg('');
     setRegulatorSuccessMsg('');
+    const proposal = recallProposals.find((rp) => rp.id === proposalId);
+    let signerOverride: SandboxSignerProfile | undefined;
     const rbac = canRoleExecuteAction(activeSigner.role, 'PROPOSE_RECALL');
-    if (!rbac.allowed) {
-      setRegulatorErrorMsg(
-        rbac.reason || `Please switch to a Safety Regulator account to co-sign recalls.`
-      );
-      return;
+    const alreadySignedByCurrent = proposal?.approvals.some(
+      (addr) => addr.toLowerCase() === activeSigner.address.toLowerCase()
+    );
+    if (!rbac.allowed || alreadySignedByCurrent) {
+      if (autoSwitchSupplyRole) {
+        const reg1Signed = proposal?.approvals.some(
+          (addr) => addr.toLowerCase() === ROLE_SIGNERS[3].address.toLowerCase()
+        );
+        const nextRegIdx = reg1Signed ? 4 : 3;
+        signerOverride = ROLE_SIGNERS[nextRegIdx];
+        handleSelectSignerIndex(nextRegIdx);
+      } else if (!rbac.allowed) {
+        setRegulatorErrorMsg(
+          rbac.reason || `Please switch to a Safety Regulator account to co-sign recalls.`
+        );
+        return;
+      }
     }
     try {
-      const res = await executeSignedCommand('recall-approve', proposalId, { proposalId });
+      const res = await executeSignedCommand(
+        'recall-approve',
+        proposalId,
+        { proposalId },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       if (res.quorumReached) {
         setRegulatorSuccessMsg(
           `2-of-2 approvals completed! Class I Recall is now active for ${String(res.batchCode || '')}.`
@@ -1337,12 +1725,23 @@ export default function App() {
     setRegulatorErrorMsg('');
     setRegulatorSuccessMsg('');
     const rbac = canRoleExecuteAction(activeSigner.role, 'WITNESS_DESTRUCTION');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setRegulatorErrorMsg(rbac.reason || 'Please switch to a Safety Regulator account.');
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        setRegulatorErrorMsg(rbac.reason || 'Please switch to a Safety Regulator account.');
+        return;
+      }
     }
     try {
-      const res = await executeSignedCommand('witness-destruction', batchId, { batchId });
+      const res = await executeSignedCommand(
+        'witness-destruction',
+        batchId,
+        { batchId },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       setRegulatorSuccessMsg(
         `Confirmed witnessed disposal of ${String(res.transitioned || 0)} recalled pack(s).`
       );
@@ -1354,26 +1753,40 @@ export default function App() {
   const handleRegisterParticipant = async (e: React.FormEvent) => {
     e.preventDefault();
     const rbac = canRoleExecuteAction(activeSigner.role, 'MANAGE_PARTICIPANTS');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setParticipantMsg(
-        rbac.reason || `Switch to a Safety Regulator account to authorize new organizations.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        setParticipantMsg(
+          rbac.reason || `Switch to a Safety Regulator account to authorize new organizations.`
+        );
+        return;
+      }
     }
+    const suffix = String(Date.now()).slice(-4);
+    const effectiveOrgName = newOrgName.trim() || `Cardinal Health Cold Logistics #${suffix}`;
+    const effectiveLicense = newOrgLicense.trim() || `FDA-3PL-${suffix}`;
     try {
-      const res = await executeSignedCommand('participant-register', newOrgName.trim(), {
-        organizationName: newOrgName.trim(),
-        role: newOrgRole,
-        licenseNumber: newOrgLicense.trim(),
-        walletAddress: newOrgWallet.trim(),
-        region: newOrgRegion.trim() || 'US National Logistics Network',
-      });
+      const res = await executeSignedCommand(
+        'participant-register',
+        effectiveOrgName,
+        {
+          organizationName: effectiveOrgName,
+          role: newOrgRole,
+          licenseNumber: effectiveLicense,
+          walletAddress: newOrgWallet.trim(),
+          region: newOrgRegion.trim() || 'US National Logistics Network',
+        },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       const created = res.created as ParticipantEntity | undefined;
       setNewOrgName('');
       setNewOrgWallet('');
       setNewOrgLicense('');
       setParticipantMsg(
-        `Authorized ${created?.organizationName || newOrgName} as ${created?.role || newOrgRole}.`
+        `Authorized ${created?.organizationName || effectiveOrgName} as ${created?.role || newOrgRole} (${effectiveLicense}).`
       );
     } catch (err) {
       setParticipantMsg(err instanceof Error ? err.message : String(err));
@@ -1382,14 +1795,25 @@ export default function App() {
 
   const handleToggleParticipantAuth = async (id: string) => {
     const rbac = canRoleExecuteAction(activeSigner.role, 'MANAGE_PARTICIPANTS');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setParticipantMsg(
-        rbac.reason || `Switch to a Safety Regulator account to modify network access.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        setParticipantMsg(
+          rbac.reason || `Switch to a Safety Regulator account to modify network access.`
+        );
+        return;
+      }
     }
     try {
-      await executeSignedCommand('participant-toggle', id, { id });
+      await executeSignedCommand(
+        'participant-toggle',
+        id,
+        { id },
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
     } catch (err) {
       setParticipantMsg(err instanceof Error ? err.message : String(err));
     }
@@ -1397,14 +1821,25 @@ export default function App() {
 
   const handleResetPersistentDatabase = async () => {
     const rbac = canRoleExecuteAction(activeSigner.role, 'LEDGER_RESET');
+    let signerOverride: SandboxSignerProfile | undefined;
     if (!rbac.allowed) {
-      setParticipantMsg(
-        rbac.reason || `Switch to a Safety Regulator role in the top menu to reset demo data.`
-      );
-      return;
+      if (autoSwitchSupplyRole) {
+        signerOverride = ROLE_SIGNERS[3];
+        handleSelectSignerIndex(3);
+      } else {
+        setParticipantMsg(
+          rbac.reason || `Switch to a Safety Regulator role in the top menu to reset demo data.`
+        );
+        return;
+      }
     }
     try {
-      await executeSignedCommand('ledger-reset', 'GLOBAL', {});
+      await executeSignedCommand(
+        'ledger-reset',
+        'GLOBAL',
+        {},
+        signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+      );
       setLastDispensedZkWitness(null);
       setLastHardwarePacket(null);
       setOfflineResultOverride(null);
@@ -1508,13 +1943,18 @@ export default function App() {
             <button
               type="button"
               data-testid="active-mode-trigger"
-              onClick={() => setModeMenuOpen((o) => !o)}
+              onClick={() => {
+                setModeMenuOpen((o) => !o);
+                setRoleMenuOpen(false);
+              }}
               aria-expanded={modeMenuOpen}
-              title="Inspect active ledger, verification, and RBAC modes"
+              title="Inspect and toggle active ledger, offline verification, and RBAC modes"
               className={`px-2 sm:px-2.5 py-1.5 text-[11px] sm:text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 sm:gap-1.5 ${
                 simulatedOfflineMode
                   ? 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border-amber-500/30'
-                  : 'bg-slate-900 hover:bg-slate-800 text-slate-200 border-slate-700'
+                  : !autoSwitchSupplyRole
+                    ? 'bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border-sky-500/30'
+                    : 'bg-slate-900 hover:bg-slate-800 text-slate-200 border-slate-700'
               }`}
             >
               {simulatedOfflineMode ? (
@@ -1524,7 +1964,13 @@ export default function App() {
               )}
               <span>
                 <span className="hidden sm:inline">Mode: </span>
-                {simulatedOfflineMode ? 'Offline' : evmStatus?.connected ? 'Live EVM' : 'SQLite'}
+                {simulatedOfflineMode
+                  ? 'Offline'
+                  : !autoSwitchSupplyRole
+                    ? 'Strict RBAC'
+                    : evmStatus?.connected
+                      ? 'Live EVM'
+                      : 'SQLite'}
               </span>
               <ChevronDown className="w-3 h-3 shrink-0 text-slate-400 hidden sm:inline" />
             </button>
@@ -1532,14 +1978,34 @@ export default function App() {
             {modeMenuOpen && (
               <div
                 data-testid="active-mode-popover"
-                className="fixed left-3 right-3 top-14 sm:absolute sm:left-auto sm:right-0 sm:top-auto sm:mt-2 sm:w-80 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-3.5 z-50 text-xs space-y-2.5"
+                className="fixed left-3 right-3 top-14 sm:absolute sm:left-auto sm:right-0 sm:top-auto sm:mt-2 sm:w-88 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-3.5 z-50 text-xs space-y-2.5"
               >
                 <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                  <span className="font-semibold text-slate-100">Active Operating Modes</span>
-                  <span className="text-[10px] font-mono text-slate-400">v{ledgerVersion}</span>
+                  <div>
+                    <div className="font-semibold text-slate-100">Active Operating Modes</div>
+                    <div className="text-[10px] text-slate-400">
+                      Control ledger storage, offline clinic verification &amp; role enforcement
+                    </div>
+                  </div>
+                  <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                    v{ledgerVersion}
+                  </span>
                 </div>
 
-                <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1">
+                {modeMenuFeedback && (
+                  <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1.5 text-[11px] text-emerald-200 flex items-center justify-between gap-2">
+                    <span>{modeMenuFeedback}</span>
+                    <button
+                      type="button"
+                      onClick={() => setModeMenuFeedback('')}
+                      className="text-[10px] text-slate-400 hover:text-slate-200 shrink-0"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+
+                <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-semibold text-slate-200">1. Ledger Storage</span>
                     <span className="text-[11px] font-mono text-emerald-400">
@@ -1547,10 +2013,34 @@ export default function App() {
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
-                    {evmStatus?.connected
-                      ? 'Dual-writing signed custody events to local Anvil EVM smart contracts and SQLite WAL.'
-                      : 'Every custody handover seals an EIP-712 signature into a SHA-256 hash-chained SQLite ledger.'}
+                    {custodyEvents.length} Custody Blocks &middot; {telemetry.length} Cold-Chain
+                    Blocks &middot; {auditLog.length} Signed Envelopes sealed in SHA-256 chain.
                   </p>
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await refreshFullLedger();
+                        await probeEvmStatus();
+                        setModeMenuFeedback(
+                          `Verified ${custodyEvents.length} custody blocks & ${telemetry.length} cold-chain blocks (v${ledgerVersion}).`
+                        );
+                      }}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 transition-colors"
+                    >
+                      Verify Ledger &amp; Probe EVM
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await handleResetPersistentDatabase();
+                        setModeMenuFeedback('Reset demo ledger back to clean genesis state.');
+                      }}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors"
+                    >
+                      Reset Demo Data
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1.5">
@@ -1561,21 +2051,52 @@ export default function App() {
                         simulatedOfflineMode ? 'text-amber-300' : 'text-sky-400'
                       }`}
                     >
-                      {simulatedOfflineMode ? 'Offline Cache' : 'Online Live'}
+                      {simulatedOfflineMode ? 'Offline Cache Active' : 'Online Live'}
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
                     {simulatedOfflineMode
-                      ? 'Verifying scans locally against the cached IndexedDB Merkle & ECDSA snapshot.'
-                      : 'Validating QR signatures, geo-velocity checks, and cold-chain history in real time.'}
+                      ? `Verifying QR scans locally against ${offlineVault?.packs.length || packs.length} cached packs in IndexedDB without internet.`
+                      : `Validating QR signatures, geo-velocity checks, and cold-chain history live (${offlineVault?.packs.length || packs.length} packs cached for offline fallback).`}
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => setSimulatedOfflineMode((prev) => !prev)}
-                    className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
-                  >
-                    {simulatedOfflineMode ? 'Switch to Online Mode' : 'Test Offline Clinic Mode'}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !simulatedOfflineMode;
+                        setSimulatedOfflineMode(next);
+                        setModeMenuFeedback(
+                          next
+                            ? 'Offline Clinic Mode enabled: QR scans now verify against IndexedDB snapshot.'
+                            : 'Online Live Mode restored: QR scans verify against live SQLite ledger.'
+                        );
+                        setTopBarStatusMsg(
+                          next
+                            ? 'Offline Clinic Mode ON: Customer & clinic QR scans are verified locally using the cached IndexedDB Merkle & ECDSA vault.'
+                            : 'Switched back to Online Live Verification Mode.'
+                        );
+                      }}
+                      className={`px-2.5 py-1 text-[11px] font-medium rounded-md border transition-colors ${
+                        simulatedOfflineMode
+                          ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/40'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                      }`}
+                    >
+                      {simulatedOfflineMode ? 'Switch to Online Mode' : 'Test Offline Clinic Mode'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await syncOfflineEdgeVault();
+                        setModeMenuFeedback(
+                          `Offline IndexedDB vault refreshed (${packs.length} packs & ${batches.length} batches cached).`
+                        );
+                      }}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 transition-colors"
+                    >
+                      Refresh Offline Cache
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 space-y-1.5">
@@ -1586,20 +2107,39 @@ export default function App() {
                         autoSwitchSupplyRole ? 'text-sky-300' : 'text-emerald-400'
                       }`}
                     >
-                      {autoSwitchSupplyRole ? 'Guided Auto-Switch' : 'Strict Enforcement'}
+                      {autoSwitchSupplyRole ? 'Guided Auto-Switch' : 'Strict Role Lock'}
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400 leading-relaxed">
                     {autoSwitchSupplyRole
-                      ? 'Automatically switches to the required Manufacturer, Carrier, or Pharmacy signer on handover.'
-                      : 'Blocks unauthorized roles so you can prove strict smart-contract style RBAC.'}
+                      ? 'Automatically switches to Manufacturer, Distributor, Pharmacy, or Regulator when you click handover steps.'
+                      : `Locked to ${activeSigner.label}. Actions outside ${activeSigner.role} permissions are blocked by smart-contract RBAC.`}
                   </p>
                   <button
                     type="button"
-                    onClick={() => setAutoSwitchSupplyRole((prev) => !prev)}
-                    className="px-2.5 py-1 text-[11px] font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+                    onClick={() => {
+                      const next = !autoSwitchSupplyRole;
+                      setAutoSwitchSupplyRole(next);
+                      setModeMenuFeedback(
+                        next
+                          ? 'Guided Auto-Switch enabled: Handovers automatically select the matching signer.'
+                          : `Strict RBAC Lock enabled: Only ${activeSigner.role} actions are permitted until you switch Role.`
+                      );
+                      setTopBarStatusMsg(
+                        next
+                          ? 'Guided Auto-Switch ON: Clicking supply-chain steps automatically selects the required role signer.'
+                          : `Strict Role Enforcement ON: Locked to ${activeSigner.label} (${activeSigner.role}). Unauthorized actions will be rejected.`
+                      );
+                    }}
+                    className={`px-2.5 py-1 text-[11px] font-medium rounded-md border transition-colors ${
+                      !autoSwitchSupplyRole
+                        ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border-emerald-500/40'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                    }`}
                   >
-                    {autoSwitchSupplyRole ? 'Use Strict RBAC' : 'Enable 1-Click Guided Mode'}
+                    {autoSwitchSupplyRole
+                      ? 'Enable Strict Role Lock'
+                      : 'Enable Guided Auto-Switch'}
                   </button>
                 </div>
 
@@ -1611,7 +2151,7 @@ export default function App() {
                   }}
                   className="w-full py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 font-semibold border border-emerald-500/30 transition-colors"
                 >
-                  Open Audit & Proofs Studio
+                  Open Audit &amp; Proofs Studio
                 </button>
               </div>
             )}
@@ -1619,8 +2159,13 @@ export default function App() {
 
           <button
             type="button"
-            onClick={() => setRedTeamOpen(true)}
-            title="Test counterfeit & spoofing defenses live"
+            data-testid="security-lab-trigger"
+            onClick={() => {
+              setModeMenuOpen(false);
+              setRoleMenuOpen(false);
+              setRedTeamOpen(true);
+            }}
+            title="Launch interactive Red-Team Security Lab to test counterfeit, replay, RBAC, and resale attacks"
             className="px-2 sm:px-2.5 py-1.5 text-[11px] sm:text-xs font-medium rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 sm:gap-1.5"
           >
             <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
@@ -1633,12 +2178,16 @@ export default function App() {
           <div className="relative" ref={roleMenuRef}>
             <button
               type="button"
-              onClick={() => setRoleMenuOpen((o) => !o)}
+              data-testid="role-menu-trigger"
+              onClick={() => {
+                setRoleMenuOpen((o) => !o);
+                setModeMenuOpen(false);
+              }}
               aria-expanded={roleMenuOpen}
               aria-label={`Switch active role, currently ${activeSigner.label}`}
               className="px-2 sm:px-3 py-1.5 text-[11px] sm:text-xs font-semibold rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 sm:gap-1.5"
             >
-              <span className="truncate max-w-[76px] sm:max-w-none">
+              <span className="truncate max-w-[70px] sm:max-w-none">
                 {injectedWalletAddress ? (
                   `Wallet ${injectedWalletAddress.slice(0, 4)}..${injectedWalletAddress.slice(-3)}`
                 ) : (
@@ -1652,41 +2201,115 @@ export default function App() {
             </button>
 
             {roleMenuOpen && (
-              <div className="absolute right-0 mt-2 w-64 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 text-xs">
-                <div className="px-2.5 py-1.5 text-[11px] font-medium text-slate-400 border-b border-slate-800 mb-1">
-                  Switch Operating Account
+              <div
+                data-testid="role-menu-popover"
+                className="fixed left-3 right-3 top-14 sm:absolute sm:left-auto sm:right-0 sm:top-auto sm:mt-2 sm:w-80 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-2.5 z-50 text-xs space-y-1.5"
+              >
+                <div className="px-2 py-1.5 border-b border-slate-800 flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-slate-100">Switch Operating Role</div>
+                    <div className="text-[10px] text-slate-400">
+                      Select an EIP-712 cryptographic actor wallet
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAutoSwitchSupplyRole((prev) => !prev)}
+                    className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                      autoSwitchSupplyRole
+                        ? 'bg-sky-500/10 text-sky-300 border-sky-500/30'
+                        : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                    }`}
+                    title="Toggle between Guided Auto-Switch and Strict Role Lock"
+                  >
+                    {autoSwitchSupplyRole ? 'Auto-Switch ON' : 'Strict Lock ON'}
+                  </button>
                 </div>
-                {ROLE_SIGNERS.map((signer, idx) => {
-                  const isActive = !injectedWalletAddress && signerIndex === idx;
-                  return (
-                    <button
-                      key={signer.address}
-                      type="button"
-                      onClick={() => handleSelectSignerIndex(idx)}
-                      className={`w-full text-left px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 transition-colors ${
-                        isActive
-                          ? 'bg-emerald-500/15 text-emerald-300 font-semibold'
-                          : 'text-slate-200 hover:bg-slate-800'
-                      }`}
-                    >
-                      <div>
-                        <div>{signer.label}</div>
-                        <div className="text-[10px] font-mono text-slate-400">
-                          {signer.address.slice(0, 8)}...{signer.address.slice(-4)}
+
+                <div className="space-y-1">
+                  {ROLE_SIGNERS.map((signer, idx) => {
+                    const isActive = !injectedWalletAddress && signerIndex === idx;
+                    const roleSummary =
+                      signer.role === 'MANUFACTURER'
+                        ? 'Mint batches, seal QR codes & dispatch to distributor'
+                        : signer.role === 'DISTRIBUTOR'
+                          ? 'Log cold-chain transit telemetry & deliver to pharmacy'
+                          : signer.role === 'PHARMACY'
+                            ? 'Receive medicine at store & sell/dispense to patient'
+                            : signer.label.includes('#2')
+                              ? 'Co-sign 2-of-2 Class I recalls & Shamir key shares'
+                              : 'Quarantine breached lots & propose Class I recalls';
+                    const portalLabel =
+                      signer.role === 'MANUFACTURER'
+                        ? 'Supply Chain'
+                        : signer.role === 'DISTRIBUTOR'
+                          ? 'Cold Chain'
+                          : signer.role === 'PHARMACY'
+                            ? 'Verify & Sell'
+                            : 'Recall & Safety';
+
+                    return (
+                      <div
+                        key={signer.address}
+                        className={`rounded-lg border p-2 transition-colors ${
+                          isActive
+                            ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'
+                            : 'bg-slate-950/60 border-slate-800/80 text-slate-200 hover:bg-slate-800/70'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleSelectSignerIndex(idx, false)}
+                            className="text-left flex-1 min-w-0"
+                          >
+                            <div className="font-semibold flex items-center gap-1.5">
+                              <span className="truncate">{signer.label}</span>
+                              {isActive && (
+                                <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              )}
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-400">
+                              {signer.address.slice(0, 10)}...{signer.address.slice(-6)} &middot;{' '}
+                              {signer.role}
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">
+                              {roleSummary}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSelectSignerIndex(idx, true)}
+                            className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-medium text-emerald-300 border border-slate-700 shrink-0 transition-colors"
+                            title={`Switch to ${signer.label} and open ${portalLabel}`}
+                          >
+                            {portalLabel} &rarr;
+                          </button>
                         </div>
                       </div>
-                      {isActive && <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
-                    </button>
-                  );
-                })}
-                <div className="border-t border-slate-800 mt-1 pt-1">
+                    );
+                  })}
+                </div>
+
+                <div className="border-t border-slate-800 pt-1.5 space-y-1">
                   <button
                     type="button"
                     onClick={handleConnectBrowserWallet}
-                    className="w-full text-left px-2.5 py-2 rounded-lg text-slate-300 hover:bg-slate-800 flex items-center gap-2"
+                    className={`w-full text-left px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 transition-colors ${
+                      injectedWalletAddress
+                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 font-semibold'
+                        : 'text-slate-300 hover:bg-slate-800 border border-transparent'
+                    }`}
                   >
-                    <Wallet className="w-3.5 h-3.5 text-sky-400" />
-                    Connect Browser Wallet
+                    <span className="flex items-center gap-2">
+                      <Wallet className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span>
+                        {injectedWalletAddress
+                          ? `Disconnect External Wallet (${injectedWalletAddress.slice(0, 6)}...${injectedWalletAddress.slice(-4)})`
+                          : 'Connect Browser / Inspector Wallet'}
+                      </span>
+                    </span>
+                    {injectedWalletAddress && <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />}
                   </button>
                 </div>
               </div>
@@ -1724,6 +2347,102 @@ export default function App() {
 
       {/* Main Content Container */}
       <main className="flex-1 max-w-[1380px] w-full mx-auto px-3 sm:px-6 py-5 sm:py-8 space-y-6 sm:space-y-7">
+        {(topBarStatusMsg ||
+          simulatedOfflineMode ||
+          !autoSwitchSupplyRole ||
+          injectedWalletAddress) && (
+          <div
+            data-testid="active-mode-role-banner"
+            className="rounded-xl border border-slate-800 bg-slate-900/90 px-4 py-2.5 text-xs text-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
+                Active Signer: {activeSigner.label} ({activeSigner.role})
+              </span>
+              {simulatedOfflineMode && (
+                <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono">
+                  Mode: Offline Clinic Cache ({offlineVault?.packs.length || packs.length} packs)
+                </span>
+              )}
+              {!autoSwitchSupplyRole && (
+                <span className="px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-300 font-mono">
+                  Strict Role Lock ON ({activeSigner.role} only)
+                </span>
+              )}
+              {injectedWalletAddress && (
+                <span className="px-2 py-0.5 rounded bg-purple-500/15 border border-purple-500/30 text-purple-300 font-mono">
+                  External Wallet: {injectedWalletAddress.slice(0, 8)}...
+                  {injectedWalletAddress.slice(-4)}
+                </span>
+              )}
+              {topBarStatusMsg && <span className="text-slate-300">{topBarStatusMsg}</span>}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {simulatedOfflineMode && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSimulatedOfflineMode(false);
+                    setTopBarStatusMsg('');
+                  }}
+                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 text-[11px]"
+                >
+                  Go Online
+                </button>
+              )}
+              {!autoSwitchSupplyRole && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAutoSwitchSupplyRole(true);
+                    setTopBarStatusMsg('');
+                  }}
+                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 text-[11px]"
+                >
+                  Enable Auto-Switch
+                </button>
+              )}
+              {topBarStatusMsg && (
+                <button
+                  type="button"
+                  onClick={() => setTopBarStatusMsg('')}
+                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 text-[11px]"
+                >
+                  Dismiss
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {liveSseBanner && (
+          <div
+            role="alert"
+            className="rounded-xl border border-rose-700/80 bg-rose-950/40 px-4 py-3 text-xs text-rose-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+          >
+            <div className="flex items-center gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span className="font-medium">{liveSseBanner}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveSection('cold-chain')}
+                className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-sky-300 font-medium"
+              >
+                Open Cold Chain
+              </button>
+              <button
+                type="button"
+                onClick={() => setLiveSseBanner('')}
+                className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Clean 4-Metric Summary Strip */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 flex flex-col justify-between gap-2.5">
@@ -1863,21 +2582,37 @@ export default function App() {
             custodyEvents={custodyEvents}
             telemetry={telemetry}
             participants={participants}
+            logisticsHubs={logisticsHubs}
             auditLog={auditLog}
             evmStatus={evmStatus}
             activeRole={activeSigner.role}
             issuerPublicAddress={issuerPublicAddress}
             onAdvanceStage={handleAdvanceFlowStage}
+            onCreateBatchAndSelect={handleCreateBatchAndSelect}
+            onRecordBatchTelemetry={handleRecordBatchTelemetry}
+            onInspectorQuarantineBatch={handleInspectorQuarantineFromFlow}
+            onInspectorExecuteRecall={handleInspectorRecallFromFlow}
+            onOpenColdChainMonitor={(batchId) => {
+              setSelectedBatchForIoT(batchId);
+              setActiveSection('cold-chain');
+            }}
+            onTestForgedQRForPack={handleTestForgedQRForPack}
             onOpenCustomerVerify={(serial) => {
               setActiveSection('verify');
               handleVerifySerial(serial, false);
             }}
             onOpenSupplyChainMap={(serial) => {
-              setTrackedMapPackSerial(serial);
+              handleSelectActivePackAcrossTabs(serial);
               setActiveSection('supply-chain');
+            }}
+            onOpenRegulatorPortal={(batchId) => {
+              setSelectedBatchForIoT(batchId);
+              setActiveSection('regulator');
             }}
             onOpenAuditStudio={() => setActiveSection('explorer')}
             onOpenSecurityLab={() => setRedTeamOpen(true)}
+            selectedPackSerial={lastScannedSerial}
+            onSelectPackSerial={handleSelectActivePackAcrossTabs}
           />
         )}
 
@@ -1919,6 +2654,9 @@ export default function App() {
             reportSubmittedMsg={reportSubmittedMsg}
             onSubmitReport={handleReportSuspiciousPack}
             batches={batches}
+            dispensedSampleSerial={
+              packs.find((p) => p.status === 'DISPENSED')?.serialNumber || 'SN-PCV20-2026-0005'
+            }
           />
         )}
 
@@ -2099,17 +2837,38 @@ export default function App() {
             prefillZkWitness={prefillZkWitness}
             onProbeEvmRpc={probeEvmStatus}
             activeRole={activeSigner.role}
-            onAnchorBatchMerkleRoot={(batchId, merkleRoot) => {
-              executeSignedCommand('anchor-merkle', batchId, { batchId, merkleRoot }).catch(
-                (err) => setParticipantMsg(err instanceof Error ? err.message : String(err))
+            selectedPackSerial={lastScannedSerial}
+            selectedBatchId={selectedBatchForIoT}
+            onSelectPackSerial={handleSelectActivePackAcrossTabs}
+            onAnchorBatchMerkleRoot={async (batchId, merkleRoot) => {
+              let signerOverride: SandboxSignerProfile | undefined;
+              if (activeSigner.role !== 'MANUFACTURER' && autoSwitchSupplyRole) {
+                signerOverride = ROLE_SIGNERS[0];
+                handleSelectSignerIndex(0);
+              }
+              await executeSignedCommand(
+                'anchor-merkle',
+                batchId,
+                { batchId, merkleRoot },
+                signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
               );
             }}
             onAuditBreakGlassShamir={async (serialNumber, shareIndices, unsealedShares) => {
-              await executeSignedCommand('break-glass-shamir', serialNumber, {
+              let signerOverride: SandboxSignerProfile | undefined;
+              if (activeSigner.role !== 'REGULATOR' && autoSwitchSupplyRole) {
+                signerOverride = ROLE_SIGNERS[3];
+                handleSelectSignerIndex(3);
+              }
+              await executeSignedCommand(
+                'break-glass-shamir',
                 serialNumber,
-                shareIndices,
-                unsealedShares,
-              });
+                {
+                  serialNumber,
+                  shareIndices,
+                  unsealedShares,
+                },
+                signerOverride ? { signerOverride, clearInjectedWallet: true } : undefined
+              );
             }}
             onResetPersistentDatabase={handleResetPersistentDatabase}
             participants={participants}
@@ -2145,12 +2904,17 @@ export default function App() {
         onClose={() => setRedTeamOpen(false)}
         batches={batches}
         packs={packs}
+        selectedPackSerial={lastScannedSerial}
         ledgerVersion={ledgerVersion}
         onSyncLedgerState={applyServerState}
         onInspectVerifiedPack={(serialNumber, pufCloned) => {
           setRedTeamOpen(false);
           setActiveSection('verify');
           handleVerifySerial(serialNumber, false, Boolean(pufCloned));
+        }}
+        onNavigateToSection={(section) => {
+          setRedTeamOpen(false);
+          setActiveSection(section);
         }}
       />
     </div>

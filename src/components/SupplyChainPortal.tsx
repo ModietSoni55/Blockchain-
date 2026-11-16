@@ -305,13 +305,28 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
             onSubmit={props.onCreateBatch}
             className="lg:col-span-5 min-w-0 bg-slate-900 border border-slate-800 rounded-xl p-5 sm:p-6 space-y-4"
           >
-            <div>
-              <h2 className="text-base font-semibold text-slate-100">
-                Register New Medicine Batch
-              </h2>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Creates a new manufacturing lot, digital pack labels, and shipment route.
-              </p>
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <h2 className="text-base font-semibold text-slate-100">
+                  Register New Medicine Batch
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Creates a new manufacturing lot, digital pack labels, and shipment route.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const suffix = String(Date.now()).slice(-4);
+                  props.onChangeNewBatchCode(`BATCH-MRNA-${suffix}`);
+                  props.onChangeNewBrandName('Comirnaty mRNA Cold-Chain Vial');
+                  props.onChangeNewMinTemp(2);
+                  props.onChangeNewMaxTemp(8);
+                }}
+                className="px-2.5 py-1 rounded-md bg-slate-950 hover:bg-slate-800 border border-slate-700 text-[11px] font-medium text-emerald-300 whitespace-nowrap shrink-0"
+              >
+                Fill Sample Batch
+              </button>
             </div>
 
             <div>
@@ -426,6 +441,8 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
               </div>
               <div className="flex flex-wrap sm:flex-nowrap gap-2">
                 <select
+                  id="mint-packs-batch-select"
+                  name="mintPacksBatchSelect"
                   aria-label="Select Batch to Mint Packs"
                   value={props.selectedBatchForMint}
                   onChange={(e) => props.onChangeSelectedBatchForMint(e.target.value)}
@@ -438,6 +455,8 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
                   ))}
                 </select>
                 <input
+                  id="mint-packs-count-input"
+                  name="mintPacksCount"
                   type="number"
                   aria-label="Number of packs to mint"
                   min={1}
@@ -469,6 +488,8 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
                 </p>
               </div>
               <input
+                id="pack-inventory-filter-input"
+                name="packFilterQuery"
                 type="text"
                 aria-label="Filter serialized packs"
                 value={props.packFilterQuery}
@@ -679,9 +700,34 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
               </select>
             </div>
             <div>
-              <label htmlFor="delivery-temp-input" className="block text-slate-400 mb-1">
-                Delivery Temp (°C)
-              </label>
+              <div className="flex items-center justify-between gap-1 mb-1">
+                <label htmlFor="delivery-temp-input" className="block text-slate-400">
+                  Delivery Temp (°C)
+                </label>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => props.onChangeDeliveryHandoverTemp('4.4')}
+                    className="px-1.5 py-0.5 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[10px] font-mono"
+                  >
+                    4.4°C Safe
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => props.onChangeDeliveryHandoverTemp('-1.5')}
+                    className="px-1.5 py-0.5 rounded bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/30 text-[10px] font-mono"
+                  >
+                    -1.5°C Drop
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => props.onChangeDeliveryHandoverTemp('14.5')}
+                    className="px-1.5 py-0.5 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-[10px] font-mono"
+                  >
+                    14.5°C Spike
+                  </button>
+                </div>
+              </div>
               <input
                 id="delivery-temp-input"
                 type="number"
@@ -871,9 +917,18 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
                               Dispense to Patient
                             </button>
                           ) : (
-                            <span className="text-slate-400">
-                              Dispensed ({pack.dispensedAt?.slice(0, 10)})
-                            </span>
+                            <div className="inline-flex items-center gap-1.5">
+                              <span className="text-slate-400">
+                                Dispensed ({pack.dispensedAt?.slice(0, 10)})
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => props.onInspectPackQR(pack.serialNumber)}
+                                className="px-2.5 py-1 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-rose-300 rounded-md whitespace-nowrap font-semibold"
+                              >
+                                Test Resale Scan
+                              </button>
+                            </div>
                           )}
                         </div>
                       </td>
@@ -915,6 +970,8 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
             <div className="lg:col-span-5 min-w-0 p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-3 text-xs">
               <div className="font-semibold text-slate-200">Create New Shipping Pallet</div>
               <select
+                id="pallet-batch-select"
+                name="palletBatchId"
                 aria-label="Pallet Batch Select"
                 value={props.palletBatchId}
                 onChange={(e) => props.onChangePalletBatchId(e.target.value)}
@@ -936,12 +993,16 @@ export const SupplyChainPortal: React.FC<SupplyChainPortalProps> = (props) => {
                   )
                   .map((pk) => {
                     const checked = props.selectedPalletSerials.includes(pk.serialNumber);
+                    const checkboxId = `pallet-pack-${pk.serialNumber}`;
                     return (
                       <label
                         key={pk.serialNumber}
+                        htmlFor={checkboxId}
                         className="flex items-center gap-2 font-mono text-[11px] text-slate-200 cursor-pointer"
                       >
                         <input
+                          id={checkboxId}
+                          name={checkboxId}
                           type="checkbox"
                           checked={checked}
                           onChange={() => props.onTogglePalletSerial(pk.serialNumber)}

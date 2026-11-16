@@ -32,8 +32,20 @@ export const ColdChainChart: React.FC<ColdChainChartProps> = ({
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
-  const yMin = -2;
-  const yMax = 18;
+  const temps = ordered.map((r) => r.temperature);
+  const rawMin = Math.min(minTemp - 4, ...(temps.length > 0 ? temps.map((t) => t - 2) : [minTemp - 4]));
+  const rawMax = Math.max(maxTemp + 4, ...(temps.length > 0 ? temps.map((t) => t + 2) : [maxTemp + 4]));
+  const yMin = Math.floor(rawMin / 2) * 2;
+  const yMax = Math.max(yMin + 10, Math.ceil(rawMax / 2) * 2);
+
+  const tickStep = Math.max(1, Math.ceil((yMax - yMin) / 4));
+  const gridTicks: number[] = [];
+  for (let t = yMin; t <= yMax; t += tickStep) {
+    gridTicks.push(t);
+  }
+  if (gridTicks[gridTicks.length - 1] < yMax) {
+    gridTicks.push(yMax);
+  }
 
   const toY = (temp: number): number => {
     const clamped = Math.min(Math.max(temp, yMin), yMax);
@@ -130,7 +142,7 @@ export const ColdChainChart: React.FC<ColdChainChartProps> = ({
             </defs>
 
             {/* Horizontal grid lines */}
-            {[0, 4, 8, 12, 16].map((gridTemp) => {
+            {gridTicks.map((gridTemp) => {
               const y = toY(gridTemp);
               return (
                 <g key={gridTemp}>

@@ -129,9 +129,9 @@ export function formatVerdictHeadline(outcome: VerificationOutcome): {
       };
     case 'COLD_CHAIN_BREACHED':
       return {
-        title: 'Warning: Storage Temperature Exceeded',
-        badge: 'Cold-Chain Alert',
-        tone: 'warn',
+        title: 'Alert: Cold-Chain Storage Breached',
+        badge: 'Unsafe Temperature',
+        tone: 'danger',
       };
     case 'PHOTOCOPY_CLONE_DETECTED':
       return {
@@ -159,9 +159,9 @@ export function formatVerdictHeadline(outcome: VerificationOutcome): {
       };
     case 'ALREADY_DISPENSED':
       return {
-        title: 'Warning: Already Dispensed to a Patient',
-        badge: 'Previously Dispensed',
-        tone: 'warn',
+        title: 'Blocked: Already Sold / Previously Dispensed QR',
+        badge: 'Previously Sold · Potential Fake',
+        tone: 'danger',
       };
     case 'RECALLED':
       return {

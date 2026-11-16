@@ -111,3 +111,37 @@ test('EIP-712 command signer + server RBAC verification authorizes Regulator LED
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('SqliteLedgerStore enforces immutable append-only SQLite triggers on telemetry table while allowing authorized factory reset', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'medsupply-tel-immut-'));
+  const dbPath = path.join(tmpDir, 'test-immut.db');
+  try {
+    const store = new SqliteLedgerStore(dbPath);
+    const initial = store.getFullState();
+    assert.equal(initial.telemetry.length >= 1, true);
+    assert.ok(initial.telemetry[0].blockHash);
+    assert.ok(initial.telemetry[0].prevBlockHash);
+
+    const rawDb = (store as unknown as { db: { exec: (sql: string) => void } }).db;
+    assert.throws(() => {
+      rawDb.exec(`UPDATE telemetry SET data = '{"temperature":4.0}' WHERE id = '${initial.telemetry[0].id}';`);
+    }, /ImmutableColdChainLedger/);
+
+    assert.throws(() => {
+      rawDb.exec(`DELETE FROM telemetry WHERE id = '${initial.telemetry[0].id}';`);
+    }, /ImmutableColdChainLedger/);
+
+    const resetState = store.resetToSeedState();
+    assert.equal(resetState.telemetry.length >= 1, true);
+
+    // Triggers must remain enforced immediately after reset
+    assert.throws(() => {
+      rawDb.exec(`UPDATE telemetry SET data = '{"temperature":99.9}' WHERE id = '${resetState.telemetry[0].id}';`);
+    }, /ImmutableColdChainLedger/);
+
+    store.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

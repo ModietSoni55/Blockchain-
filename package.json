@@ -4,19 +4,19 @@
   "version": "1.0.0",
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.5.0"
   },
   "scripts": {
-    "doctor": "node scripts/check-local.mjs",
-    "predev": "node scripts/check-local.mjs --quiet",
+    "doctor": "node --no-warnings scripts/check-local.mjs",
+    "predev": "node --no-warnings scripts/check-local.mjs --quiet",
     "dev": "tsx server.ts",
-    "prestart": "node scripts/check-local.mjs --quiet",
+    "prestart": "node --no-warnings scripts/check-local.mjs --quiet",
     "start": "tsx server.ts",
     "start:prod": "tsx server.ts --prod",
     "build": "vite build",
     "preview": "vite preview",
     "test": "tsx --test src/utils/sentinelLogic.test.ts server/securityIntegration.test.ts",
-    "clean": "node -e \"const fs=require('fs'); for(const p of ['dist','server.js']) fs.rmSync(p,{recursive:true,force:true});\"",
+    "clean": "node -e \"import('node:fs').then(fs=>{for(const p of ['dist','server.js'])fs.rmSync(p,{recursive:true,force:true})})\"",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

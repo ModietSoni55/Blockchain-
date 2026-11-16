@@ -104,6 +104,34 @@ export interface TelemetryEvent {
   isBreached: boolean;
   breachType?: 'OVERHEATING' | 'SUBCOOLING';
   txHash?: string;
+  blockIndex?: number;
+  prevBlockHash?: string;
+  payloadDigest?: string;
+  blockHash?: string;
+  signerAddress?: string;
+  evmTxHash?: string;
+}
+
+export interface TelemetryChainBlock {
+  event: TelemetryEvent;
+  blockIndex: number;
+  prevBlockHash: string;
+  expectedPrevBlockHash: string;
+  payloadDigest: string;
+  computedBlockHash: string;
+  recordedBlockHash: string;
+  isBlockValid: boolean;
+  isLinkValid: boolean;
+  tamperReason?: string;
+}
+
+export interface TelemetryChainVerificationResult {
+  blocks: TelemetryChainBlock[];
+  allValid: boolean;
+  totalBlocks: number;
+  brokenCount: number;
+  firstBrokenBlockIndex: number | null;
+  latestBlockHash: string;
 }
 
 export interface MedicinePackRecord {
@@ -599,10 +627,12 @@ export function calculateAIRiskScore(params: {
     rawWeights.regulatory_quarantine = 0.45;
   }
 
-  if (params.isDispensed && params.scanCount > 1) {
-    score += 68;
-    reasons.push('Medicine pack already dispensed to a previous patient; potential refill or clone attack');
-    rawWeights.dispensed_reuse = 0.38;
+  if (params.isDispensed) {
+    score += params.scanCount > 1 ? 74 : 68;
+    reasons.push(
+      'Medicine pack already dispensed to a previous patient (ERC-5192 Soulbound locked); reusing this QR indicates counterfeit or unauthorized resale'
+    );
+    rawWeights.dispensed_reuse = 0.42;
   }
 
   if (params.scanCount > 1 && !params.isDispensed) {
@@ -713,9 +743,43 @@ export function parseQRScanInput(rawInput: string): {
     return { serialNumber: '', format: 'RAW_SERIAL' };
   }
 
-  if (/^https?:\/\//i.test(trimmed) && trimmed.includes('/21/')) {
+  // 1. Multi-line Phone Certificate QR card ("MEDSUPPLY SENTINEL ...")
+  if (trimmed.includes('MEDSUPPLY SENTINEL') || trimmed.includes('Pack Serial:')) {
+    const refMatch = /Ref:\s*([^#\s\n]+)#(0x[0-9a-fA-F]+|[0-9a-fA-F]{16,132})/i.exec(trimmed);
+    if (refMatch) {
+      return {
+        serialNumber: refMatch[1].trim(),
+        providedSignature: refMatch[2].trim(),
+        format: 'QR_COLON_PAYLOAD',
+      };
+    }
+    const serialLineMatch = /Pack Serial:\s*([A-Za-z0-9_-]+)/i.exec(trimmed);
+    const sigLineMatch = /Sig:\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]{16,132})/i.exec(trimmed);
+    if (serialLineMatch) {
+      return {
+        serialNumber: serialLineMatch[1].trim(),
+        providedSignature: sigLineMatch ? sigLineMatch[1].trim() : undefined,
+        format: sigLineMatch ? 'QR_COLON_PAYLOAD' : 'RAW_SERIAL',
+      };
+    }
+  }
+
+  // 2. HTTP/HTTPS URL (GS1 Digital Link /01/.../21/... OR /qr-verify?serial=... OR /?verify=...)
+  if (/^https?:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
+      const qSerial =
+        url.searchParams.get('serial')?.trim() ||
+        url.searchParams.get('verify')?.trim() ||
+        undefined;
+      const qSig = url.searchParams.get('sig')?.trim() || undefined;
+      if (qSerial) {
+        return {
+          serialNumber: qSerial,
+          providedSignature: qSig,
+          format: 'GS1_DIGITAL_LINK',
+        };
+      }
       const segments = url.pathname.split('/').filter(Boolean);
       const ai21Index = segments.indexOf('21');
       if (ai21Index !== -1 && segments[ai21Index + 1]) {
@@ -984,11 +1048,11 @@ export function evaluatePackVerification(
     };
   }
 
-  if (isDispensed && isDuplicate) {
+  if (isDispensed) {
     return {
       outcome: 'ALREADY_DISPENSED',
       isAuthentic: false,
-      message: `This pack was already dispensed (${pack.dispensedAt?.slice(0, 10) || 'prior'}). Duplicate scan indicates potential counterfeit reuse.`,
+      message: `Counterfeit / Resale Alert: Pack ${pack.serialNumber} was already sold & dispensed (${pack.dispensedAt?.slice(0, 10) || 'prior'}) and permanently Soulbound-locked. If this pack was just handed to you as new, the QR code has been reused on a fake or previously sold medicine.`,
       pack,
       batch,
       custodyTimeline,
@@ -999,10 +1063,18 @@ export function evaluatePackVerification(
   }
 
   if (coldChainBreached) {
+    const breachedReadings = telemetryHistory.filter((t) => t.isBreached);
+    const latestBreach = breachedReadings[0];
+    const breachLabel =
+      latestBreach?.breachType === 'SUBCOOLING'
+        ? `dropped to ${latestBreach.temperature.toFixed(1)}°C (below safe minimum ${batch.minTemp}°C)`
+        : latestBreach
+        ? `reached ${latestBreach.temperature.toFixed(1)}°C (above safe maximum ${batch.maxTemp}°C)`
+        : `went outside ${batch.minTemp}°C–${batch.maxTemp}°C`;
     return {
       outcome: 'COLD_CHAIN_BREACHED',
       isAuthentic: false,
-      message: `Cold-chain temperature breach detected for Batch ${batch.batchCode}. Safe range is ${batch.minTemp}°C to ${batch.maxTemp}°C.`,
+      message: `Cold-chain temperature breach detected for Batch ${batch.batchCode}: sensor ${breachLabel}. Safe range is ${batch.minTemp}°C to ${batch.maxTemp}°C.`,
       pack,
       batch,
       custodyTimeline,
@@ -1405,6 +1477,166 @@ export function buildHashChainedBlocks(events: CustodyEvent[]): EVMBlockHeaderRe
   }
 
   return blocks.reverse();
+}
+
+export const TELEMETRY_GENESIS_PREV_HASH =
+  '0x0000000000000000000000000000000000000000000000000000000000000000';
+
+/**
+ * Deterministic Keccak-256 fingerprint of an individual temperature sensor reading.
+ */
+export function computeTelemetryPayloadDigest(evt: TelemetryEvent): string {
+  return computeKeccakHex(
+    `COLDCHAIN_PAYLOAD_V1:${evt.id}:${evt.batchId}:${evt.temperature.toFixed(2)}:${evt.humidity.toFixed(2)}:${evt.latitude.toFixed(4)}:${evt.longitude.toFixed(4)}:${evt.deviceId}:${evt.timestamp}:${evt.isBreached ? '1' : '0'}:${evt.breachType || 'SAFE'}:${evt.signerAddress || 'GATEWAY'}`
+  );
+}
+
+/**
+ * Computes the linked Cold-Chain Blockchain block hash referencing blockIndex, prevBlockHash, and payloadDigest.
+ */
+export function computeTelemetryBlockHash(
+  blockIndex: number,
+  prevBlockHash: string,
+  payloadDigest: string
+): string {
+  return computeKeccakHex(`COLDCHAIN_BLOCK_V1:${blockIndex}:${prevBlockHash}:${payloadDigest}`);
+}
+
+/**
+ * Seals a newly appended telemetry reading onto the head of the existing cold-chain telemetry blockchain.
+ */
+export function sealTelemetryEventChain(
+  evt: TelemetryEvent,
+  existingTelemetry: TelemetryEvent[]
+): TelemetryEvent {
+  const chronological = [...existingTelemetry].sort(
+    (a, b) =>
+      (a.blockIndex ?? 0) - (b.blockIndex ?? 0) ||
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+  const lastEvt = chronological[chronological.length - 1];
+  const blockIndex = lastEvt ? (lastEvt.blockIndex ?? chronological.length) + 1 : 1;
+  const prevBlockHash = lastEvt?.blockHash || TELEMETRY_GENESIS_PREV_HASH;
+  const payloadDigest = computeTelemetryPayloadDigest(evt);
+  const blockHash = computeTelemetryBlockHash(blockIndex, prevBlockHash, payloadDigest);
+
+  return {
+    ...evt,
+    blockIndex,
+    prevBlockHash,
+    payloadDigest,
+    blockHash,
+    txHash: evt.txHash || blockHash,
+  };
+}
+
+/**
+ * Seals an ordered sequence of seed/initial telemetry events from Genesis (Block #1) onward.
+ */
+export function sealTelemetrySequence(events: TelemetryEvent[]): TelemetryEvent[] {
+  const chronological = [...events].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+  const sealed: TelemetryEvent[] = [];
+  for (const evt of chronological) {
+    sealed.push(sealTelemetryEventChain(evt, sealed));
+  }
+  return sealed.reverse();
+}
+
+/**
+ * Verifies cryptographic immutability of the full Cold-Chain Temperature Blockchain.
+ * Any modification to a stored temperature reading breaks both its payloadDigest/blockHash
+ * AND cascades link invalidation to every subsequent block in the chain.
+ */
+export function buildTelemetryHashChain(
+  readings: TelemetryEvent[],
+  tamperOverride?: { id: string; temperature: number }
+): TelemetryChainVerificationResult {
+  if (!readings || readings.length === 0) {
+    return {
+      blocks: [],
+      allValid: true,
+      totalBlocks: 0,
+      brokenCount: 0,
+      firstBrokenBlockIndex: null,
+      latestBlockHash: TELEMETRY_GENESIS_PREV_HASH,
+    };
+  }
+
+  const chronological = [...readings].sort((a, b) => {
+    if (a.blockIndex !== undefined && b.blockIndex !== undefined && a.blockIndex !== b.blockIndex) {
+      return a.blockIndex - b.blockIndex;
+    }
+    return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+  });
+
+  const blocks: TelemetryChainBlock[] = [];
+  let expectedPrevHash = TELEMETRY_GENESIS_PREV_HASH;
+  let brokenCount = 0;
+  let firstBrokenBlockIndex: number | null = null;
+  let cascadeBroken = false;
+
+  for (let i = 0; i < chronological.length; i++) {
+    const rawEvt = chronological[i];
+    const isTargetedTamper = Boolean(tamperOverride && tamperOverride.id === rawEvt.id);
+    const effectiveEvt: TelemetryEvent = isTargetedTamper
+      ? { ...rawEvt, temperature: tamperOverride!.temperature }
+      : rawEvt;
+
+    const blockIndex = rawEvt.blockIndex ?? i + 1;
+    const payloadDigest = computeTelemetryPayloadDigest(effectiveEvt);
+    const computedBlockHash = computeTelemetryBlockHash(blockIndex, expectedPrevHash, payloadDigest);
+    const recordedPrevHash = rawEvt.prevBlockHash || expectedPrevHash;
+    const recordedBlockHash = rawEvt.blockHash || computedBlockHash;
+
+    const prevLinkMatches = recordedPrevHash.toLowerCase() === expectedPrevHash.toLowerCase();
+    const blockHashMatches = recordedBlockHash.toLowerCase() === computedBlockHash.toLowerCase();
+    const isLinkValid = !cascadeBroken && prevLinkMatches;
+    const isBlockValid = !cascadeBroken && prevLinkMatches && blockHashMatches;
+
+    let tamperReason: string | undefined;
+    if (!blockHashMatches) {
+      tamperReason = `Stored temperature (${effectiveEvt.temperature.toFixed(1)}°C) fails Keccak-256 block hash verification against immutable seal.`;
+      cascadeBroken = true;
+    } else if (!prevLinkMatches || cascadeBroken) {
+      tamperReason = `Previous block hash link broken — upstream temperature record was altered.`;
+      cascadeBroken = true;
+    }
+
+    if (!isBlockValid) {
+      brokenCount++;
+      if (firstBrokenBlockIndex === null) {
+        firstBrokenBlockIndex = blockIndex;
+      }
+    }
+
+    blocks.push({
+      event: effectiveEvt,
+      blockIndex,
+      prevBlockHash: recordedPrevHash,
+      expectedPrevBlockHash: expectedPrevHash,
+      payloadDigest,
+      computedBlockHash,
+      recordedBlockHash,
+      isBlockValid,
+      isLinkValid,
+      tamperReason,
+    });
+
+    expectedPrevHash = computedBlockHash;
+  }
+
+  const latestBlockHash = blocks[blocks.length - 1]?.computedBlockHash || TELEMETRY_GENESIS_PREV_HASH;
+
+  return {
+    blocks: blocks.reverse(),
+    allValid: brokenCount === 0,
+    totalBlocks: blocks.length,
+    brokenCount,
+    firstBrokenBlockIndex,
+    latestBlockHash,
+  };
 }
 
 /**
@@ -2399,6 +2631,614 @@ export function verifyNIZKPrescriptionProof(proof: NIZKPrescriptionProof): boole
   }
 }
 
+export type SupplyChainStageId = 'MANUFACTURER' | 'DISTRIBUTOR' | 'PHARMACY' | 'CUSTOMER_INSPECTOR';
 
+export interface ForensicStageCheckpoint {
+  stageId: SupplyChainStageId;
+  stageTitle: string;
+  actor: string;
+  location: string;
+  recordedTempC?: number;
+  safeRangeLabel: string;
+  tempStatus: 'SAFE' | 'SUBCOOLING_DROP' | 'OVERHEAT_SPIKE' | 'PENDING';
+  stageStatus:
+    | 'VERIFIED'
+    | 'TEMP_BREACH_ORIGIN'
+    | 'COUNTERFEIT_OR_DIVERSION'
+    | 'RESOLD_LOCKED_ORIGIN'
+    | 'REGULATORY_HOLD'
+    | 'PENDING';
+  incidentSummary?: string;
+  timestamp?: string;
+  blockOrTxHash?: string;
+  telemetryBlockIndex?: number;
+}
 
+export interface ForensicViolationItem {
+  id: string;
+  category:
+    | 'TEMPERATURE_DROP'
+    | 'TEMPERATURE_SPIKE'
+    | 'PREVIOUSLY_SOLD_RESALE'
+    | 'COUNTERFEIT_QR_SIGNATURE'
+    | 'PHOTOCOPY_PUF_CLONE'
+    | 'UNAUTHORIZED_DIVERSION'
+    | 'REGULATORY_HOLD';
+  severity: 'CRITICAL' | 'HIGH';
+  detectedAtStage: SupplyChainStageId;
+  culpritActor: string;
+  culpritLocation: string;
+  timestamp: string;
+  title: string;
+  detail: string;
+  inspectorAction: string;
+  evidenceHash?: string;
+}
+
+export interface PackForensicAttributionReport {
+  serialNumber: string;
+  batchCode: string;
+  overallStatus:
+    | 'AUTHENTIC_SAFE'
+    | 'BLOCKED_COUNTERFEIT'
+    | 'BLOCKED_RESOLD_QR'
+    | 'BLOCKED_TEMP_BREACH'
+    | 'BLOCKED_DIVERSION'
+    | 'BLOCKED_REGULATORY_HOLD';
+  headline: string;
+  subheadline: string;
+  stages: ForensicStageCheckpoint[];
+  violations: ForensicViolationItem[];
+}
+
+/**
+ * Forensically attributes any cold-chain temperature drop/spike, counterfeit QR signature,
+ * photocopy clone, unauthorized broker diversion, or previously-sold resale to the exact
+ * supply-chain stage, actor, facility location, and blockchain block.
+ */
+export function traceSupplyChainStageForensics(
+  pack: MedicinePackRecord | undefined,
+  batch: BatchRecord | undefined,
+  custodyEvents: CustodyEvent[],
+  telemetry: TelemetryEvent[],
+  options?: {
+    tamperBlockOne?: boolean;
+    signatureTampered?: boolean;
+    pufCloned?: boolean;
+    simulateResaleScan?: boolean;
+  }
+): PackForensicAttributionReport {
+  const safeMin = batch?.minTemp ?? 2.0;
+  const safeMax = batch?.maxTemp ?? 8.0;
+  const safeRangeLabel = `${safeMin.toFixed(1)}°C – ${safeMax.toFixed(1)}°C`;
+
+  if (!pack || !batch) {
+    return {
+      serialNumber: 'UNREGISTERED',
+      batchCode: 'UNKNOWN',
+      overallStatus: 'BLOCKED_COUNTERFEIT',
+      headline: 'Counterfeit Alert: Unregistered Medicine Serial',
+      subheadline: 'Serial number does not exist in the Manufacturer Genesis Registry.',
+      stages: [],
+      violations: [
+        {
+          id: 'v-unreg',
+          category: 'COUNTERFEIT_QR_SIGNATURE',
+          severity: 'CRITICAL',
+          detectedAtStage: 'CUSTOMER_INSPECTOR',
+          culpritActor: 'Unregistered Counterfeit Source',
+          culpritLocation: 'Customer / Inspector Verification Point',
+          timestamp: new Date().toISOString(),
+          title: 'Unregistered Serial Number',
+          detail: 'No manufacturer mint transaction or Merkle leaf exists for this QR code.',
+          inspectorAction: 'Seize counterfeit package immediately and alert Drug Control Inspector.',
+        },
+      ],
+    };
+  }
+
+  const packEvents = custodyEvents.filter(
+    (e) =>
+      e.serialHash.toLowerCase() === pack.serialHash.toLowerCase() ||
+      (e.batchId === batch.batchId &&
+        (e.action.includes('COLD_CHAIN') ||
+          e.action.includes('QUARANTINE') ||
+          e.action.includes('RECALL') ||
+          e.action.includes('BROKER')))
+  );
+
+  const batchTelemetry = telemetry.filter((t) => t.batchId === batch.batchId);
+  const chronologicalTelemetry = [...batchTelemetry].reverse();
+
+  const genesisEvent =
+    packEvents.find((e) => e.action === 'MINT_GENESIS') ||
+    packEvents[packEvents.length - 1];
+  const distEvent = packEvents.find((e) => e.action === 'TRANSFER_DISTRIBUTOR');
+  const pharmEvent = packEvents.find((e) => e.action === 'TRANSFER_PHARMACY');
+  const dispenseEvent = packEvents.find(
+    (e) => e.action === 'DISPENSED_TO_PATIENT' || e.action === 'DISPENSE_PATIENT'
+  );
+  const brokerEvent = packEvents.find(
+    (e) =>
+      e.action.includes('BROKER') ||
+      e.toActor.toLowerCase().includes('broker') ||
+      e.fromActor.toLowerCase().includes('broker')
+  );
+
+  // Match telemetry to stages by location/device or order
+  const mfgTempReading =
+    chronologicalTelemetry.find(
+      (t) =>
+        t.deviceId.includes('MFG') ||
+        t.locationLabel.toLowerCase().includes('plant') ||
+        t.locationLabel.toLowerCase().includes('kalamazoo') ||
+        t.locationLabel.toLowerCase().includes('raleigh')
+    ) || chronologicalTelemetry[0];
+
+  const pharmTempReading = batchTelemetry.find(
+    (t) =>
+      t.deviceId.includes('PHARM') ||
+      t.deviceId.includes('HANDOVER-PROBE-04') ||
+      t.locationLabel.toLowerCase().includes('pharmacy') ||
+      t.locationLabel.toLowerCase().includes('medical') ||
+      t.locationLabel.toLowerCase().includes('clinic') ||
+      (pharmEvent && t.locationLabel.toLowerCase().includes(pharmEvent.location.toLowerCase().slice(0, 10)))
+  );
+
+  const distTempReading =
+    batchTelemetry.find(
+      (t) =>
+        t.id !== mfgTempReading?.id &&
+        t.id !== pharmTempReading?.id &&
+        (t.isBreached ||
+          t.deviceId.includes('DIST') ||
+          t.deviceId.includes('REEFER') ||
+          t.locationLabel.toLowerCase().includes('hub') ||
+          t.locationLabel.toLowerCase().includes('transit') ||
+          t.locationLabel.toLowerCase().includes('corridor') ||
+          t.locationLabel.toLowerCase().includes('depot') ||
+          t.locationLabel.toLowerCase().includes('port'))
+    ) ||
+    batchTelemetry.find((t) => t.isBreached) ||
+    batchTelemetry[0];
+
+  const classifyTemp = (t?: TelemetryEvent): 'SAFE' | 'SUBCOOLING_DROP' | 'OVERHEAT_SPIKE' | 'PENDING' => {
+    if (!t) return 'PENDING';
+    if (!t.isBreached) return 'SAFE';
+    return t.breachType === 'SUBCOOLING' ? 'SUBCOOLING_DROP' : 'OVERHEAT_SPIKE';
+  };
+
+  const violations: ForensicViolationItem[] = [];
+
+  // 1. Check Genesis / QR Signature Tampering or PUF Clone
+  if (options?.tamperBlockOne || options?.signatureTampered) {
+    violations.push({
+      id: `v-sig-${pack.serialNumber}`,
+      category: 'COUNTERFEIT_QR_SIGNATURE',
+      severity: 'CRITICAL',
+      detectedAtStage: options?.tamperBlockOne ? 'MANUFACTURER' : 'CUSTOMER_INSPECTOR',
+      culpritActor: options?.tamperBlockOne
+        ? 'Tampered Genesis Block Payload'
+        : 'Counterfeit Label Forger',
+      culpritLocation: pack.lastScannedLocation || 'QR Verification Scanner',
+      timestamp: new Date().toISOString(),
+      title: options?.tamperBlockOne
+        ? 'Blockchain Genesis Hash Mismatch (Block #1 Tampered)'
+        : 'Forged QR ECDSA Digital Signature Detected',
+      detail: options?.tamperBlockOne
+        ? `Genesis Block #1 payload for ${pack.serialNumber} was altered, invalidating downstream prevBlockHash links at Distributor and Pharmacy.`
+        : `QR code signature on ${pack.serialNumber} failed secp256k1 ecrecover against Manufacturer public key (${batch.manufacturerAddress.slice(0, 10)}...).`,
+      inspectorAction: 'Reject forged pack immediately and lock serial in counterfeit registry.',
+      evidenceHash: pack.signature,
+    });
+  }
+
+  if (options?.pufCloned) {
+    violations.push({
+      id: `v-puf-${pack.serialNumber}`,
+      category: 'PHOTOCOPY_PUF_CLONE',
+      severity: 'CRITICAL',
+      detectedAtStage: 'CUSTOMER_INSPECTOR',
+      culpritActor: 'Cloned Packaging Counterfeiter',
+      culpritLocation: pack.lastScannedLocation || 'Optical PUF Scanner',
+      timestamp: new Date().toISOString(),
+      title: 'Photocopied QR Label (Optical PUF Micro-Seal Mismatch)',
+      detail: `Valid QR text was copied onto a fake box; 256-bit physical optical scatter fingerprint deviated beyond the 28-bit Hamming threshold.`,
+      inspectorAction: 'Quarantine suspect lot at pharmacy and trace physical distributor pallet.',
+      evidenceHash: pack.pufSealHash,
+    });
+  }
+
+  // 2. Check Unauthorized Broker Diversion
+  if (brokerEvent) {
+    violations.push({
+      id: `v-div-${brokerEvent.id}`,
+      category: 'UNAUTHORIZED_DIVERSION',
+      severity: 'CRITICAL',
+      detectedAtStage: 'DISTRIBUTOR',
+      culpritActor: brokerEvent.toActor.includes('Broker') ? brokerEvent.toActor : brokerEvent.fromActor,
+      culpritLocation: brokerEvent.location,
+      timestamp: brokerEvent.timestamp,
+      title: `Unauthorized Grey-Market Broker Diversion at ${brokerEvent.location}`,
+      detail: `Custody diverted outside licensed corridor (${brokerEvent.fromActor} → ${brokerEvent.toActor}) without authorized Distributor/Pharmacy role credentials.`,
+      inspectorAction: 'Issue immediate Regulatory Quarantine on batch and suspend distributor license.',
+      evidenceHash: brokerEvent.txHash,
+    });
+  }
+
+  // 3. Check All Cold-Chain Temperature Breaches & Attribute Stage + Location
+  const breachedReadings = batchTelemetry.filter((t) => t.isBreached);
+  for (const breach of breachedReadings) {
+    const isPharmBreach =
+      breach.id === pharmTempReading?.id ||
+      breach.deviceId.includes('PHARM') ||
+      breach.locationLabel.toLowerCase().includes('pharmacy') ||
+      breach.locationLabel.toLowerCase().includes('clinic');
+    const isMfgBreach =
+      breach.id === mfgTempReading?.id &&
+      (breach.deviceId.includes('MFG') || breach.locationLabel.toLowerCase().includes('plant'));
+
+    const breachStage: SupplyChainStageId = isPharmBreach
+      ? 'PHARMACY'
+      : isMfgBreach
+      ? 'MANUFACTURER'
+      : 'DISTRIBUTOR';
+
+    const culpritActor =
+      breachStage === 'PHARMACY'
+        ? pharmEvent?.toActor || 'Receiving Hospital Pharmacy'
+        : breachStage === 'MANUFACTURER'
+        ? batch.manufacturerName
+        : distEvent?.toActor || 'Cold-Chain Logistics Distributor';
+
+    const isSubcooling = breach.breachType === 'SUBCOOLING' || breach.temperature < safeMin;
+    violations.push({
+      id: `v-temp-${breach.id}`,
+      category: isSubcooling ? 'TEMPERATURE_DROP' : 'TEMPERATURE_SPIKE',
+      severity: 'CRITICAL',
+      detectedAtStage: breachStage,
+      culpritActor,
+      culpritLocation: breach.locationLabel,
+      timestamp: breach.timestamp,
+      title: isSubcooling
+        ? `Temperature Drop (${breach.temperature.toFixed(1)}°C < ${safeMin.toFixed(1)}°C) at ${breach.locationLabel}`
+        : `Temperature Spike (${breach.temperature.toFixed(1)}°C > ${safeMax.toFixed(1)}°C) at ${breach.locationLabel}`,
+      detail: `Cold-chain sensor (${breach.deviceId}) recorded ${breach.temperature.toFixed(1)}°C (required ${safeRangeLabel}) under ${culpritActor}, permanently sealed on Cold-Chain Block #${breach.blockIndex ?? 1}.`,
+      inspectorAction: `Quarantine batch ${batch.batchCode} and audit cold storage unit at ${breach.locationLabel}.`,
+      evidenceHash: breach.blockHash || breach.txHash,
+    });
+  }
+
+  // 4. Check Previously Sold / Dispensed Resale
+  const isDispensed = pack.status === 'DISPENSED';
+  const isResaleViolation =
+    options?.simulateResaleScan !== undefined
+      ? Boolean(options.simulateResaleScan)
+      : isDispensed;
+
+  if (isResaleViolation) {
+    const sellerPharmacy =
+      dispenseEvent?.fromActor || pharmEvent?.toActor || 'City Central Hospital Pharmacy';
+    const saleLocation =
+      dispenseEvent?.location || pharmEvent?.location || pack.lastScannedLocation || 'Hospital Pharmacy Desk';
+    const saleTime = pack.dispensedAt || dispenseEvent?.timestamp || new Date().toISOString();
+
+    violations.push({
+      id: `v-resale-${pack.serialNumber}`,
+      category: 'PREVIOUSLY_SOLD_RESALE',
+      severity: 'CRITICAL',
+      detectedAtStage: 'PHARMACY',
+      culpritActor: sellerPharmacy,
+      culpritLocation: saleLocation,
+      timestamp: saleTime,
+      title: `Previously Sold QR Reused / Resold (Dispensed at ${saleLocation})`,
+      detail: `Pack ${pack.serialNumber} was already sold & dispensed by ${sellerPharmacy} at ${saleLocation} (${saleTime.slice(0, 16).replace('T', ' ')} UTC) and locked via ERC-5192 Soulbound token + ZK receipt ${ (pack.dispensedToReceipt || '0x9850...').slice(0, 12)}.... Presenting this QR again as an unsold medicine proves resale or label cloning.`,
+      inspectorAction: `Flag counterfeit resale at ${saleLocation} and notify Safety Inspector.`,
+      evidenceHash: dispenseEvent?.txHash || pack.dispensedToReceipt,
+    });
+  }
+
+  // 5. Check Regulatory Quarantine / Recall Hold
+  if (batch.isQuarantined || batch.isRecalled || pack.status === 'QUARANTINED' || pack.status === 'RECALLED') {
+    violations.push({
+      id: `v-reg-${batch.batchId}`,
+      category: 'REGULATORY_HOLD',
+      severity: 'CRITICAL',
+      detectedAtStage: 'CUSTOMER_INSPECTOR',
+      culpritActor: 'National Drug Controller / FDA Inspector',
+      culpritLocation: 'National Regulatory Enforcement Registry',
+      timestamp: new Date().toISOString(),
+      title: batch.isRecalled
+        ? `Batch ${batch.batchCode} Blocked by Class I Recall Order`
+        : `Batch ${batch.batchCode} Blocked by Inspector Quarantine Hold`,
+      detail: batch.quarantineReason || 'Active safety hold enforced on-chain; dispensing and transit are locked.',
+      inspectorAction: 'Isolate inventory in quarantine vault for witnessed regulatory disposal.',
+      evidenceHash: batch.batchId,
+    });
+  }
+
+  const distHasBreach = violations.some(
+    (v) =>
+      v.detectedAtStage === 'DISTRIBUTOR' &&
+      (v.category === 'TEMPERATURE_DROP' || v.category === 'TEMPERATURE_SPIKE')
+  );
+  const pharmHasBreach = violations.some(
+    (v) =>
+      v.detectedAtStage === 'PHARMACY' &&
+      (v.category === 'TEMPERATURE_DROP' || v.category === 'TEMPERATURE_SPIKE')
+  );
+
+  const stage1: ForensicStageCheckpoint = {
+    stageId: 'MANUFACTURER',
+    stageTitle: '1. Manufacturer Origin',
+    actor: batch.manufacturerName,
+    location: genesisEvent?.location || 'Kalamazoo Sterile Plant, Kalamazoo, MI',
+    recordedTempC: mfgTempReading?.temperature,
+    safeRangeLabel,
+    tempStatus: classifyTemp(mfgTempReading),
+    stageStatus: options?.tamperBlockOne ? 'COUNTERFEIT_OR_DIVERSION' : 'VERIFIED',
+    incidentSummary: options?.tamperBlockOne
+      ? 'Genesis Block #1 hash was tampered after minting.'
+      : `Minted with Keccak-256 hash & ECDSA signature (${safeRangeLabel}).`,
+    timestamp: genesisEvent?.timestamp || batch.manufacturedAt,
+    blockOrTxHash: genesisEvent?.txHash || pack.serialHash,
+    telemetryBlockIndex: mfgTempReading?.blockIndex,
+  };
+
+  const stage2Done =
+    Boolean(distEvent) ||
+    pack.status === 'IN_TRANSIT' ||
+    pack.status === 'AT_PHARMACY' ||
+    pack.status === 'DISPENSED';
+
+  const stage2: ForensicStageCheckpoint = {
+    stageId: 'DISTRIBUTOR',
+    stageTitle: '2. Distributor Transit',
+    actor: brokerEvent
+      ? brokerEvent.toActor
+      : distEvent?.toActor || 'Apex Cold-Chain Logistics',
+    location: brokerEvent
+      ? brokerEvent.location
+      : distEvent?.location || distTempReading?.locationLabel || 'Chicago O’Hare Cold Hub, IL',
+    recordedTempC: distTempReading?.temperature,
+    safeRangeLabel,
+    tempStatus: classifyTemp(distTempReading),
+    stageStatus: brokerEvent
+      ? 'COUNTERFEIT_OR_DIVERSION'
+      : distHasBreach
+      ? 'TEMP_BREACH_ORIGIN'
+      : stage2Done
+      ? 'VERIFIED'
+      : 'PENDING',
+    incidentSummary: brokerEvent
+      ? `Diverted to unlicensed broker (${brokerEvent.toActor}) at ${brokerEvent.location}!`
+      : distHasBreach && distTempReading
+      ? `Temperature ${distTempReading.temperature < safeMin ? 'dropped' : 'spiked'} to ${distTempReading.temperature.toFixed(1)}°C at ${distTempReading.locationLabel} (Block #${distTempReading.blockIndex ?? 1})!`
+      : stage2Done
+      ? `Handover verified at ${distEvent?.location || 'Transit Hub'} (${distTempReading ? `${distTempReading.temperature.toFixed(1)}°C` : 'Safe'}).`
+      : 'Awaiting Manufacturer dispatch to Distributor.',
+    timestamp: brokerEvent?.timestamp || distEvent?.timestamp || distTempReading?.timestamp,
+    blockOrTxHash: brokerEvent?.txHash || distEvent?.txHash || distTempReading?.blockHash,
+    telemetryBlockIndex: distTempReading?.blockIndex,
+  };
+
+  const stage3Done =
+    Boolean(pharmEvent) || pack.status === 'AT_PHARMACY' || pack.status === 'DISPENSED';
+
+  const stage3: ForensicStageCheckpoint = {
+    stageId: 'PHARMACY',
+    stageTitle: '3. Pharmacy & Patient Sale',
+    actor: pharmEvent?.toActor || dispenseEvent?.fromActor || 'City Central Hospital Pharmacy',
+    location:
+      dispenseEvent?.location ||
+      pharmEvent?.location ||
+      pharmTempReading?.locationLabel ||
+      'Boston Medical Receiving Vault, MA',
+    recordedTempC: pharmTempReading?.temperature,
+    safeRangeLabel,
+    tempStatus: classifyTemp(pharmTempReading),
+    stageStatus: isResaleViolation
+      ? 'RESOLD_LOCKED_ORIGIN'
+      : pharmHasBreach
+      ? 'TEMP_BREACH_ORIGIN'
+      : stage3Done
+      ? 'VERIFIED'
+      : 'PENDING',
+    incidentSummary: isResaleViolation
+      ? `Pack sold & ERC-5192 Soulbound-locked at ${dispenseEvent?.location || pharmEvent?.location || 'Pharmacy'}. Presenting this QR again as a new pack is a counterfeit resale!`
+      : pharmHasBreach && pharmTempReading
+      ? `Pharmacy vault temperature ${pharmTempReading.temperature < safeMin ? 'dropped' : 'spiked'} to ${pharmTempReading.temperature.toFixed(1)}°C at ${pharmTempReading.locationLabel}!`
+      : isDispensed
+      ? `Dispensed to rightful Patient (${pack.currentCustodian}) at ${dispenseEvent?.location || pharmEvent?.location || 'Pharmacy'} (${pharmTempReading ? `${pharmTempReading.temperature.toFixed(1)}°C` : 'Safe'}) & ERC-5192 Soulbound-locked.`
+      : stage3Done
+      ? `Received at ${pharmEvent?.location || 'Pharmacy Vault'} (${pharmTempReading ? `${pharmTempReading.temperature.toFixed(1)}°C` : 'Safe'}) — ready to dispense.`
+      : 'Awaiting delivery from Distributor to Pharmacy.',
+    timestamp: dispenseEvent?.timestamp || pharmEvent?.timestamp,
+    blockOrTxHash: dispenseEvent?.txHash || pharmEvent?.txHash || pack.dispensedToReceipt,
+    telemetryBlockIndex: pharmTempReading?.blockIndex,
+  };
+
+  let overallStatus: PackForensicAttributionReport['overallStatus'] = 'AUTHENTIC_SAFE';
+  if (options?.signatureTampered || options?.pufCloned || options?.tamperBlockOne) {
+    overallStatus = 'BLOCKED_COUNTERFEIT';
+  } else if (batch.isRecalled || batch.isQuarantined || pack.status === 'QUARANTINED' || pack.status === 'RECALLED') {
+    overallStatus = 'BLOCKED_REGULATORY_HOLD';
+  } else if (brokerEvent) {
+    overallStatus = 'BLOCKED_DIVERSION';
+  } else if (isResaleViolation) {
+    overallStatus = 'BLOCKED_RESOLD_QR';
+  } else if (breachedReadings.length > 0) {
+    overallStatus = 'BLOCKED_TEMP_BREACH';
+  }
+
+  const stage4: ForensicStageCheckpoint = {
+    stageId: 'CUSTOMER_INSPECTOR',
+    stageTitle: '4. Customer QR & Inspector Audit',
+    actor: 'Customer QR Scanner & Drug Safety Inspector',
+    location: pack.lastScannedLocation || 'Customer Verification Terminal',
+    recordedTempC: batchTelemetry[0]?.temperature,
+    safeRangeLabel,
+    tempStatus: classifyTemp(batchTelemetry[0]),
+    stageStatus:
+      overallStatus === 'AUTHENTIC_SAFE'
+        ? 'VERIFIED'
+        : overallStatus === 'BLOCKED_RESOLD_QR'
+        ? 'RESOLD_LOCKED_ORIGIN'
+        : overallStatus === 'BLOCKED_TEMP_BREACH'
+        ? 'TEMP_BREACH_ORIGIN'
+        : overallStatus === 'BLOCKED_REGULATORY_HOLD'
+        ? 'REGULATORY_HOLD'
+        : 'COUNTERFEIT_OR_DIVERSION',
+    incidentSummary:
+      violations.length > 0
+        ? `${violations.length} critical anomaly(s) pinpointed: ${violations[0].title}`
+        : isDispensed
+        ? 'Verified authentic & dispensed to rightful patient; all 6 cryptographic & cold-chain checks passed.'
+        : 'All 6 cryptographic, cold-chain, and anti-resale checks passed.',
+    timestamp: pack.lastScanTimestamp || new Date().toISOString(),
+    blockOrTxHash: pack.signature,
+    telemetryBlockIndex: batchTelemetry[0]?.blockIndex,
+  };
+
+  const headline =
+    overallStatus === 'AUTHENTIC_SAFE'
+      ? isDispensed
+        ? `Verified Authentic & Dispensed to Patient (${pack.serialNumber})`
+        : `Verified Authentic & Cold-Chain Safe (${pack.serialNumber})`
+      : overallStatus === 'BLOCKED_RESOLD_QR'
+      ? `BLOCKED: Previously Sold QR Code Resold (${pack.serialNumber})`
+      : overallStatus === 'BLOCKED_TEMP_BREACH'
+      ? `BLOCKED: Cold-Chain Temperature Breach Pinpointed (${pack.serialNumber})`
+      : overallStatus === 'BLOCKED_DIVERSION'
+      ? `BLOCKED: Unauthorized Broker Diversion Pinpointed (${pack.serialNumber})`
+      : overallStatus === 'BLOCKED_REGULATORY_HOLD'
+      ? `BLOCKED: Active Inspector Quarantine / Recall Hold (${batch.batchCode})`
+      : `BLOCKED: Counterfeit / Tampered QR Signature Detected (${pack.serialNumber})`;
+
+  const subheadline =
+    violations.length > 0
+      ? `${violations[0].detail}`
+      : `Every custody handover from ${batch.manufacturerName} stays within ${safeRangeLabel} with an intact Keccak-256 hash chain.`;
+
+  return {
+    serialNumber: pack.serialNumber,
+    batchCode: batch.batchCode,
+    overallStatus,
+    headline,
+    subheadline,
+    stages: [stage1, stage2, stage3, stage4],
+    violations,
+  };
+}
+
+export type QRPhoneScanFormat = 'PHONE_CERTIFICATE' | 'MOBILE_WEB_LINK' | 'CRYPTO_PAYLOAD';
+
+/**
+ * Builds a Phone-Scannable QR payload that works when scanned by any smartphone camera:
+ * - PHONE_CERTIFICATE (default): Multi-line human-readable verification certificate (no leading colon URI scheme,
+ *   so iPhone Camera, Android Google Lens, and QR apps immediately display the medicine verdict, temperature history,
+ *   custody stage, and anti-resale status even when the laptop is running on localhost).
+ * - MOBILE_WEB_LINK: Clickable HTTPS/HTTP link to `/qr-verify` that renders a full mobile verification web page.
+ * - CRYPTO_PAYLOAD: Raw `SN-...:0x...` cryptographic signature string for hardware barcode scanners.
+ */
+export function buildPhoneScannableQRCertificate(
+  pack: MedicinePackRecord | undefined,
+  batch: BatchRecord | undefined,
+  forensicReport?: PackForensicAttributionReport,
+  options?: {
+    format?: QRPhoneScanFormat;
+    forgedSignature?: boolean;
+    clonedPuf?: boolean;
+    resoldMode?: boolean;
+    baseOriginUrl?: string;
+  }
+): string {
+  if (!pack || !batch) return 'MEDSUPPLY SENTINEL VERIFICATION READY';
+
+  const format = options?.format || 'PHONE_CERTIFICATE';
+  const activeSig = options?.forgedSignature
+    ? '0xdeadbeef0000111122223333444455556666777788889999aaaabbbbccccdddd'
+    : pack.signature;
+
+  if (format === 'CRYPTO_PAYLOAD') {
+    return `${pack.serialNumber}:${activeSig}`;
+  }
+
+  const verdictStatus = forensicReport?.overallStatus || 'AUTHENTIC_SAFE';
+  const verdictLine =
+    verdictStatus === 'AUTHENTIC_SAFE'
+      ? pack.status === 'DISPENSED'
+        ? 'VERIFIED AUTHENTIC & DISPENSED TO PATIENT'
+        : 'VERIFIED AUTHENTIC & COLD-CHAIN SAFE'
+      : verdictStatus === 'BLOCKED_RESOLD_QR'
+      ? 'BLOCKED - PREVIOUSLY SOLD QR RESOLD'
+      : verdictStatus === 'BLOCKED_TEMP_BREACH'
+      ? 'BLOCKED - COLD-CHAIN TEMPERATURE BREACH'
+      : verdictStatus === 'BLOCKED_DIVERSION'
+      ? 'BLOCKED - UNAUTHORIZED BROKER DIVERSION'
+      : verdictStatus === 'BLOCKED_REGULATORY_HOLD'
+      ? 'BLOCKED - INSPECTOR QUARANTINE / RECALL HOLD'
+      : 'BLOCKED - COUNTERFEIT / FORGED QR SIGNATURE';
+
+  const distStage = forensicReport?.stages[1];
+  const pharmStage = forensicReport?.stages[2];
+  const latestTempC =
+    pharmStage?.recordedTempC ?? distStage?.recordedTempC ?? forensicReport?.stages[0]?.recordedTempC;
+  const tempSummary =
+    latestTempC !== undefined
+      ? `${latestTempC.toFixed(1)}C (Safe ${batch.minTemp.toFixed(1)}C-${batch.maxTemp.toFixed(1)}C)`
+      : `Safe ${batch.minTemp.toFixed(1)}C-${batch.maxTemp.toFixed(1)}C`;
+
+  const primaryViolation = forensicReport?.violations[0];
+
+  if (format === 'MOBILE_WEB_LINK') {
+    const base =
+      options?.baseOriginUrl ||
+      (typeof window !== 'undefined' && window.location?.origin
+        ? window.location.origin
+        : 'https://ais-pre-yqerm45l3eeudrxhlkqja4-192493638434.asia-southeast1.run.app');
+    const params = new URLSearchParams({
+      serial: pack.serialNumber,
+      brand: batch.brandName,
+      batch: batch.batchCode,
+      verdict: verdictLine,
+      holder: pack.currentCustodian,
+      place: pack.lastScannedLocation || batch.manufacturerName,
+      temp: tempSummary,
+      issue: primaryViolation
+        ? `${primaryViolation.title} (${primaryViolation.culpritLocation})`
+        : 'None',
+      sig: activeSig,
+    });
+    return `${base}/qr-verify?${params.toString()}`;
+  }
+
+  // Default: PHONE_CERTIFICATE (works 100% offline/online on any phone QR scanner without localhost issues)
+  const lines = [
+    verdictStatus === 'AUTHENTIC_SAFE'
+      ? 'MEDSUPPLY SENTINEL CERTIFICATE'
+      : 'MEDSUPPLY SENTINEL SAFETY ALERT',
+    `VERDICT - ${verdictLine}`,
+    `Medicine - ${batch.brandName} (${batch.batchCode})`,
+    `Pack Serial: ${pack.serialNumber}`,
+    `Holder - ${pack.currentCustodian} (${pack.lastScannedLocation || 'Verified Hub'})`,
+    `Cold Chain - ${tempSummary}`,
+    `Anti-Resale Lock - ${
+      options?.resoldMode || verdictStatus === 'BLOCKED_RESOLD_QR'
+        ? 'BLOCKED (Previously Sold QR Reused)'
+        : pack.status === 'DISPENSED'
+        ? 'DISPENSED TO PATIENT (Verified)'
+        : 'UNSPENT (Active)'
+    }`,
+  ];
+
+  if (primaryViolation) {
+    lines.push(`Pinpointed Alert - ${primaryViolation.title} by ${primaryViolation.culpritActor}`);
+  } else {
+    lines.push(`Origin - ${batch.manufacturerName} (Verified ECDSA & Merkle Proof)`);
+  }
+
+  lines.push(`Ref: ${pack.serialNumber}#${activeSig}`);
+  return lines.join('\n');
+}
 

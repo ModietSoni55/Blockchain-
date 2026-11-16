@@ -515,6 +515,8 @@ export const SupplyChainTransitMap: React.FC<SupplyChainTransitMapProps> = ({
 
           {/* Batch Filter */}
           <select
+            id="map-batch-filter"
+            name="mapBatchFilter"
             aria-label="Filter Transit Map by Batch"
             value={selectedBatchFilter}
             onChange={(e) => setSelectedBatchFilter(e.target.value)}
@@ -531,6 +533,8 @@ export const SupplyChainTransitMap: React.FC<SupplyChainTransitMapProps> = ({
           {/* Track Individual Product ID Selector */}
           {packs.length > 0 && (
             <select
+              id="map-track-product-select"
+              name="mapTrackProductSelect"
               aria-label="Track Product ID on Map"
               value={activeTrackedSerial || 'NONE'}
               onChange={(e) =>
@@ -549,6 +553,8 @@ export const SupplyChainTransitMap: React.FC<SupplyChainTransitMapProps> = ({
 
           {/* Transport Mode Filter */}
           <select
+            id="map-transport-mode-filter"
+            name="mapTransportModeFilter"
             aria-label="Filter Transit Map by Transport Mode"
             value={selectedModeFilter}
             onChange={(e) => setSelectedModeFilter(e.target.value)}
